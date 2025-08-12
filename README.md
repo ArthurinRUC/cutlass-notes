@@ -8,6 +8,7 @@ The CUTLASS notes series will begin with a minimal Minimal GEMM implementation, 
 ```bash
 git clone https://github.com/ArthurinRUC/cutlass-notes.git
 # clone cutlass
+cd cutlass-notes
 git submodule update --init --recursive
 ```
 
@@ -16,7 +17,7 @@ git submodule update --init --recursive
 | Notes                     | Summary                                                                                              | Links                                                                 |
 |---------------------------|------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------|
 | **00-Intro**              | Brief introduction to CUTLASS | [intro](https://zhuanlan.zhihu.com/p/1937220431728845963)                                   |
-| **01-minimal-gemm**       | <li>Introduces CuTe fundamentals</li><li>Implements 16x8x8 GEMM kernel using single MMA instruction from scratch</li><li>Python kernel invocation, precision validation & performance benchmarking</li><li>Profiling with Nsight Compute (ncu)</li> | [minimal-gemm]()                      |
+| **01-minimal-gemm**       | <li>Introduces CuTe fundamentals</li><li>Implements 16x8x8 GEMM kernel using single MMA instruction from scratch</li><li>Python kernel invocation, precision validation & performance benchmarking</li><li>Profiling with Nsight Compute (ncu)</li> | [minimal-gemm](https://zhuanlan.zhihu.com/p/1937517614084650073)                      |
 | **02-mixed-precision-gemm** | *Coming soon*    | *Stay tuned*              |
 
 
