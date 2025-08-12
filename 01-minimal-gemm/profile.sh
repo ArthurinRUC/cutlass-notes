@@ -1,0 +1,2 @@
+# ncu --csv --log-file 01.csv  --metrics gpu__time_duration.sum --kernel-name "minimal_gemm" python minimal_gemm.py
+ncu -o ncu_prof_1 --import-source 1 --set full --kernel-name "minimal_gemm" -f python minimal_gemm.py
