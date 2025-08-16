@@ -6,7 +6,9 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 cutlass_include_path = os.path.join(current_dir, "../third-party/cutlass/include")
 sources = [os.path.join(current_dir, filename) for filename in ["minimal_gemm.cu"]]
 
-os.environ["TORCH_CUDA_ARCH_LIST"] = '.'.join(map(str,torch.cuda.get_device_capability()))
+os.environ["TORCH_CUDA_ARCH_LIST"] = ".".join(
+    map(str, torch.cuda.get_device_capability())
+)
 
 # Load CUDA extension module
 lib = load(
@@ -104,9 +106,6 @@ for exp in exps:
     a = torch.randn(M, K, device="cuda", dtype=torch.half)
     b = torch.randn(N, K, device="cuda", dtype=torch.half)
     c = torch.randn(M, N, device="cuda", dtype=torch.half)
-
-    # Warmup
-    _ = lib.minimal_gemm(a, b, None)
 
     # Case 1: MM
     kernel_output = lib.minimal_gemm(a, b, None)

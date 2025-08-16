@@ -61,7 +61,7 @@ minimal_gemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int n, int k
 
   auto copy_atom = AutoVectorizingCopy{};
 
-  copy(copy_atom, tCgA, tCrA);  // 如果 m 转置了，那么 copy 获取该 thread 对应的 A 矩阵元素时，因为 offset 的变化，获取到的便是错误的元素。
+  copy(copy_atom, tCgA, tCrA);
   copy(copy_atom, tCgB, tCrB);
 
   if constexpr (is_source_needed) copy(copy_atom, tCgC, tCrC);
