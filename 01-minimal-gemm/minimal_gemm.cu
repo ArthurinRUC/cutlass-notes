@@ -5,7 +5,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 
-template <typename Spec, bool is_source_needed = false>
+template <typename Spec, bool IsGemm>
 __global__ void
 minimal_gemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int n, int k) {
   using namespace cute;
@@ -64,8 +64,8 @@ minimal_gemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int n, int k
   copy(copy_atom, tCgA, tCrA);
   copy(copy_atom, tCgB, tCrB);
 
-  if constexpr (is_source_needed) copy(copy_atom, tCgC, tCrC);
-  else clear(tCrC);  // Set the accumulators to zero
+  if constexpr (IsGemm) clear(tCrC);  // Set the accumulators to zero
+  else copy(copy_atom, tCgC, tCrC);
 
   gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
 
@@ -129,6 +129,16 @@ struct KernelSpec {
     }                                                            \
   } while (0);
 
+#define BOOL_SWITCH(COND, CONST_NAME, ...)      \
+  [&] {                                         \
+    if (COND) {                                 \
+      constexpr static bool CONST_NAME = true;  \
+      return __VA_ARGS__();                     \
+    } else {                                    \
+      constexpr static bool CONST_NAME = false; \
+      return __VA_ARGS__();                     \
+    }                                           \
+  }()
 
 template<typename ComputeType, typename AccType = ComputeType>
 torch::Tensor
@@ -136,7 +146,8 @@ run_minimal_gemm(const torch::Tensor &a,
                  const torch::Tensor &b,
                  std::optional<torch::Tensor> &_c) {
 
-  at::cuda::CUDAGuard device_guard{a.device()};
+  at::cuda::CUDAGuard device_guard{a.get_device()};
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   const int M = 16;
   const int N = 8;
@@ -153,15 +164,15 @@ run_minimal_gemm(const torch::Tensor &a,
   }();
 
   torch::Tensor c;
-  bool is_source_needed;
+  bool is_gemm;
 
   if (!_c.has_value()) {
     auto options = torch::TensorOptions().dtype(torch_acc_type).device(torch::kCUDA);
-    c = torch::zeros({M, N}, options);
-    is_source_needed = false;
+    c = torch::empty({M, N}, options);
+    is_gemm = true;
   } else {
     c = _c.value();
-    is_source_needed = true;
+    is_gemm = false;
   }
 
   CHECK_TORCH_TENSOR_DTYPE(a, torch_compute_type)
@@ -172,14 +183,14 @@ run_minimal_gemm(const torch::Tensor &a,
   CHECK_TORCH_TENSOR_SHAPE(b, N, K)
   CHECK_TORCH_TENSOR_SHAPE(c, M, N)
 
-  spec::KernelSpec<ComputeType, M, N, K> kernel_spec;
+  using Spec = spec::KernelSpec<ComputeType, M, N, K>;
 
-  // cute::print(typename decltype(kernel_spec)::TiledMMA{});
+  // cute::print(typename Spec::TiledMMA{});
 
-  dim3 block = kernel_spec.kThreadNum;
-  dim3 grid((N + kernel_spec.kTileN - 1) / kernel_spec.kTileN,
-            (M + kernel_spec.kTileM - 1) / kernel_spec.kTileM);
-  int shm_size = kernel_spec.kShmSize;
+  dim3 block = Spec::kThreadNum;
+  dim3 grid((N + Spec::kTileN - 1) / Spec::kTileN,
+            (M + Spec::kTileM - 1) / Spec::kTileM);
+  int shm_size = Spec::kShmSize;
 
   printf("Block Size: (%d, %d, %d) | Grid Size: (%d, %d, %d) | Shared Memory Size: %d Bytes\n",
           block.x, block.y, block.z, grid.x, grid.y, grid.z, shm_size);
@@ -191,31 +202,24 @@ run_minimal_gemm(const torch::Tensor &a,
   cudaDeviceSynchronize();
 
   // Kernel launch
-  if (is_source_needed) {
-    cudaEventRecord(start, 0);
-    minimal_gemm<decltype(kernel_spec), true><<<grid, block, shm_size, 0>>>(
+  BOOL_SWITCH(is_gemm, IsGemm, [&] {
+    cudaEventRecord(start, stream);
+    minimal_gemm<Spec, IsGemm><<<grid, block, shm_size, stream>>>(
       reinterpret_cast<AccType*>(c.data_ptr()),
       reinterpret_cast<ComputeType*>(a.data_ptr()),
       reinterpret_cast<ComputeType*>(b.data_ptr()),
       M, N, K
     );
-    cudaEventRecord(stop, 0);
-  } else {
-    cudaEventRecord(start, 0);
-    minimal_gemm<decltype(kernel_spec), false><<<grid, block, shm_size, 0>>>(
-      reinterpret_cast<AccType*>(c.data_ptr()),
-      reinterpret_cast<ComputeType*>(a.data_ptr()),
-      reinterpret_cast<ComputeType*>(b.data_ptr()),
-      M, N, K
-    );
-    cudaEventRecord(stop, 0);
-  }
+    cudaEventRecord(stop, stream);
+  });
 
   cudaDeviceSynchronize();
 
   auto error = cudaGetLastError();
-  if (error) {
-    printf("Error: %s. Error code: %d\n", cudaGetErrorString(error), error);
+  if (error != cudaSuccess) {
+    throw std::runtime_error(
+      std::string("CUDA error: ") + cudaGetErrorString(error) +
+      " (error code: " + std::to_string(error) + ")");
   }
 
   float milliseconds = 0;

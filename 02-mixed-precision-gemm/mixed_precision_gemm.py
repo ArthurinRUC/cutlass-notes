@@ -95,6 +95,7 @@ def compare_matrix(kernel_output: torch.Tensor, torch_output: torch.Tensor):
     )
 
 
+
 # ---------------- fp32 = bf16 * bf16 + fp32 ----------------
 
 Ms = [16]

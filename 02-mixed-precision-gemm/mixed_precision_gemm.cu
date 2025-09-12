@@ -18,7 +18,7 @@
 #endif
 
 
-template <typename Spec, bool is_gemm = false, bool cvt_out_precision = false>
+template <typename Spec, bool IsGemm, bool IsCvtPrecision = false>
 __global__ void
 mixed_precision_gemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int n, int k, void *Outptr) {
   using namespace cute;
@@ -73,12 +73,13 @@ mixed_precision_gemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int 
 
   copy(copy_atom, tCgA, tCrA);
   copy(copy_atom, tCgB, tCrB);
-  if constexpr (is_gemm) clear(tCrC);  // Set the accumulators to zero
+
+  if constexpr (IsGemm) clear(tCrC);  // Set the accumulators to zero
   else copy(copy_atom, tCgC, tCrC);
 
   gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
 
-  if constexpr (!cvt_out_precision) {
+  if constexpr (!IsCvtPrecision) {
     copy(copy_atom, tCrC, tCgC);
   } else {
     auto tCrO = make_tensor_like<OutType>(tCrC);
@@ -156,8 +157,7 @@ namespace spec {
 
 using namespace cute;
 
-template <typename OutType_, typename ComputeTypeA_,
-          typename ComputeTypeB_, typename ComputeTypeC_,
+template <typename OutType_, typename ComputeTypeA_, typename ComputeTypeB_, typename ComputeTypeC_,
           int kTileM_ = 16, int kTileN_ = 8, int kTileK_ = 8>
 struct KernelSpec {
   using OutType = OutType_;
@@ -169,19 +169,19 @@ struct KernelSpec {
   static constexpr int kTileN = kTileN_;
   static constexpr int kTileK = kTileK_;
 
-  using MMA_op = typename std::conditional<
-    std::is_same_v<ComputeTypeA, cute::bfloat16_t> &&
-    std::is_same_v<ComputeTypeB, cute::bfloat16_t> &&
+  using MMA_op = std::conditional_t<
+    std::is_same_v<ComputeTypeA, bfloat16_t> &&
+    std::is_same_v<ComputeTypeB, bfloat16_t> &&
     std::is_same_v<ComputeTypeC, float>,
     SM80_16x8x8_F32BF16BF16F32_TN,
-    typename std::conditional<
-      std::is_same_v<ComputeTypeA, cute::float_e4m3_t> &&
-      std::is_same_v<ComputeTypeB, cute::float_e5m2_t> &&
+    std::conditional_t<
+      std::is_same_v<ComputeTypeA, float_e4m3_t> &&
+      std::is_same_v<ComputeTypeB, float_e5m2_t> &&
       std::is_same_v<ComputeTypeC, float>,
       SM90_16x8x32_F32E4M3E5M2F32_TN,
       void
-    >::type
-  >::type;
+    >
+  >;
 
   static_assert(!std::is_same_v<MMA_op, void>, "Unsupported MMA op!");
 
@@ -219,6 +219,16 @@ struct KernelSpec {
     }                                                            \
   } while (0);
 
+#define BOOL_SWITCH(COND, CONST_NAME, ...)      \
+  [&] {                                         \
+    if (COND) {                                 \
+      constexpr static bool CONST_NAME = true;  \
+      return __VA_ARGS__();                     \
+    } else {                                    \
+      constexpr static bool CONST_NAME = false; \
+      return __VA_ARGS__();                     \
+    }                                           \
+  }()
 
 template <typename T>
 constexpr torch::ScalarType to_torch_scalar_type() {
@@ -232,9 +242,8 @@ constexpr torch::ScalarType to_torch_scalar_type() {
 
 
 template <typename ComputeTypeC, typename OutType>
-constexpr bool if_cvt_out_precision() {
-  if constexpr (std::is_same_v<ComputeTypeC, OutType>) return false;
-  else return true;
+constexpr bool needs_precision_conversion() {
+  return !std::is_same_v<ComputeTypeC, OutType>;
 }
 
 
@@ -244,8 +253,9 @@ torch::Tensor
 run_mixed_precision_gemm(const torch::Tensor a,
                          const torch::Tensor b,
                          std::optional<torch::Tensor> _c) {
-  
-  at::cuda::CUDAGuard device_guard{a.device()};
+
+  at::cuda::CUDAGuard device_guard{a.get_device()};
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   auto torch_compute_type_a = to_torch_scalar_type<ComputeTypeA>();
   auto torch_compute_type_b = to_torch_scalar_type<ComputeTypeB>();
@@ -256,7 +266,7 @@ run_mixed_precision_gemm(const torch::Tensor a,
 
   if (!_c.has_value()) {
     auto options = torch::TensorOptions().dtype(torch_compute_type_c).device(torch::kCUDA);
-    c = torch::zeros({M, N}, options);
+    c = torch::empty({M, N}, options);
     is_gemm = true;
   } else {
     c = _c.value();
@@ -271,25 +281,25 @@ run_mixed_precision_gemm(const torch::Tensor a,
   CHECK_TORCH_TENSOR_SHAPE(b, N, K)
   CHECK_TORCH_TENSOR_SHAPE(c, M, N)
 
-  constexpr bool cvt_out_precision = if_cvt_out_precision<ComputeTypeC, OutType>();
+  constexpr bool IsCvtPrecision = needs_precision_conversion<ComputeTypeC, OutType>();
 
-  if constexpr (cvt_out_precision) {
+  if constexpr (IsCvtPrecision) {
     auto torch_compute_type_out = to_torch_scalar_type<OutType>();
     auto options = torch::TensorOptions().dtype(torch_compute_type_out).device(torch::kCUDA);
-    out = torch::zeros({M, N}, options);
+    out = torch::empty({M, N}, options);
     
     CHECK_TORCH_TENSOR_DTYPE(out, torch_compute_type_out)
     CHECK_TORCH_TENSOR_SHAPE(out, M, N)
   }
 
-  spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, M, N, K> kernel_spec;
+  using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, M, N, K>;
 
-  // cute::print(typename decltype(kernel_spec)::TiledMMA{});
+  // cute::print(typename Spec::TiledMMA{});
 
-  dim3 block = kernel_spec.kThreadNum;
-  dim3 grid((N + kernel_spec.kTileN - 1) / kernel_spec.kTileN,
-            (M + kernel_spec.kTileM - 1) / kernel_spec.kTileM);
-  int shm_size = kernel_spec.kShmSize;
+  dim3 block = Spec::kThreadNum;
+  dim3 grid((N + Spec::kTileN - 1) / Spec::kTileN,
+            (M + Spec::kTileM - 1) / Spec::kTileM);
+  int shm_size = Spec::kShmSize;
 
   printf("Block Size: (%d, %d, %d) | Grid Size: (%d, %d, %d) | Shared Memory Size: %d Bytes\n",
           block.x, block.y, block.z, grid.x, grid.y, grid.z, shm_size);
@@ -298,36 +308,31 @@ run_mixed_precision_gemm(const torch::Tensor a,
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
-  cudaDeviceSynchronize();
-
   auto get_data_ptr = [](const torch::Tensor& tensor) -> void* {
       return tensor.defined() ? tensor.data_ptr() : nullptr;
   };
-
   void *out_ptr = get_data_ptr(out);
 
+  cudaDeviceSynchronize();
+
   // Kernel launch
-  cudaEventRecord(start, 0);
-  if (is_gemm) {
-    mixed_precision_gemm<decltype(kernel_spec), true, cvt_out_precision>
-    <<<grid, block, shm_size>>>(
+  BOOL_SWITCH(is_gemm, IsGemm, [&] {
+    cudaEventRecord(start, stream);
+    mixed_precision_gemm<Spec, IsGemm, IsCvtPrecision>
+    <<<grid, block, shm_size, stream>>>(
       c.data_ptr(), a.data_ptr(), b.data_ptr(),
       M, N, K, out_ptr
     );
-  } else {
-    mixed_precision_gemm<decltype(kernel_spec), false, cvt_out_precision>
-    <<<grid, block, shm_size>>>(
-      c.data_ptr(), a.data_ptr(), b.data_ptr(),
-      M, N, K, out_ptr
-    );
-  }
-  cudaEventRecord(stop, 0);
+    cudaEventRecord(stop, stream);
+  });
 
   cudaDeviceSynchronize();
 
   auto error = cudaGetLastError();
-  if (error) {
-    printf("Error: %s. Error code: %d\n", cudaGetErrorString(error), error);
+  if (error != cudaSuccess) {
+    throw std::runtime_error(
+      std::string("CUDA error: ") + cudaGetErrorString(error) +
+      " (error code: " + std::to_string(error) + ")");
   }
 
   float milliseconds = 0;
@@ -337,7 +342,7 @@ run_mixed_precision_gemm(const torch::Tensor a,
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
 
-  if constexpr (cvt_out_precision) return out;
+  if constexpr (IsCvtPrecision) return out;
   else return c;
 }
 

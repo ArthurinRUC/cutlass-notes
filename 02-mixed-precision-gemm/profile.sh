@@ -1,7 +1,7 @@
 # CSV output
 # ncu --csv --log-file 02.csv  --metrics gpu__time_duration.sum --kernel-name "mixed_precision_gemm" python mixed_precision_gemm.py
 
-# # ncu-rep output
+# ncu-rep output
 ncu -o ncu_prof_2 --import-source 1 --set full --kernel-name "mixed_precision_gemm" -f python mixed_precision_gemm.py
 
 # nsys-rep output
