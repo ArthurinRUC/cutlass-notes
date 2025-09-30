@@ -577,8 +577,8 @@ run_warp_specialization(const torch::Tensor a, const torch::Tensor b, std::optio
             cute::max(cute::ceil_div(M, Spec::kTileM), Spec::kClusterDimY));
   int shm_size = Spec::kShmSize;
 
-  printf("block = (%d, ), cluster = (%d, %d), grid = (%d, %d), shm = %d\n",
-          block.x, cluster.x, cluster.y, grid.x, grid.y, shm_size);
+  printf("Block Size: (%d, %d, %d) | Cluster Size: (%d, %d, %d) | Grid Size: (%d, %d, %d) | Shared Memory Size: %d Bytes\n",
+          block.x, block.y, block.z, cluster.x, cluster.y, cluster.z, grid.x, grid.y, grid.z, shm_size);
 
   ////////////////////////////////////////////////////////////////////////////////////
   ////////////////////////////////// TMA Specific Code ///////////////////////////////
