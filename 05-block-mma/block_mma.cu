@@ -5,30 +5,26 @@
 #include <c10/cuda/CUDAGuard.h>
 
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && \
-  ((__CUDACC_VER_MAJOR__ >= 12) && (__CUDACC_VER_MINOR__ >= 4)))
-#define CUTE_ARCH_MMA_SM89_ENABLED 
-#endif
-
-
-#if defined(__CUDA_ARCH__)
-#  define CUTE_INVALID_CONTROL_PATH(x) assert(0 && x); printf(x); __brkpt()
-#else
-#  define CUTE_INVALID_CONTROL_PATH(x) assert(0 && x); printf(x)
-#endif
-
-
 template <typename Spec, bool IsGemm, bool IsCvtPrecision>
 __global__ void
-mixed_precision_gemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int n, int k, void *Outptr) {
+block_mma(void* __restrict__ Cptr,
+          const void* __restrict__ Aptr,
+          const void* __restrict__ Bptr,
+          int m, int n, int k,
+          void* __restrict__ Outptr) {
   using namespace cute;
 
   using X = Underscore;
+  using MMA_shape = typename Spec::MMA_shape;
   using OutType = typename Spec::OutType;
   using ComputeTypeA = typename Spec::ComputeTypeA;
   using ComputeTypeB = typename Spec::ComputeTypeB;
   using ComputeTypeC = typename Spec::ComputeTypeC;
   using TiledMMA = typename Spec::TiledMMA;
+  using TiledCopyA = typename Spec::TiledCopyA;
+  using TiledCopyB = typename Spec::TiledCopyB;
+  using TiledCopyC = typename Spec::TiledCopyC;
+  using TiledCopyO = typename Spec::TiledCopyO;
 
   constexpr int kTileM = Spec::kTileM;
   constexpr int kTileN = Spec::kTileN;
@@ -52,7 +48,6 @@ mixed_precision_gemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int 
   auto tiler = make_tile(Int<kTileM>{}, Int<kTileN>{}, Int<kTileK>{});
   auto coord = make_coord(0, 0, 0);
 
-  // Define the block global tensors (static)
   Tensor gA = local_tile(mA, tiler, coord, Step<_1,  X, _1>{});  // (kTileM, kTileK)
   Tensor gB = local_tile(mB, tiler, coord, Step< X, _1, _1>{});  // (kTileN, kTileK)
   Tensor gC = local_tile(mC, tiler, coord, Step<_1, _1,  X>{});  // (kTileM, kTileN)
@@ -69,88 +64,121 @@ mixed_precision_gemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int 
   Tensor tCrB = thr_mma.partition_fragment_B(gB);  // (MMA, MMA_N, MMA_K)
   Tensor tCrC = thr_mma.partition_fragment_C(gC);  // (MMA, MMA_M, MMA_N)
 
-  auto copy_atom = AutoVectorizingCopy{};
+  TiledCopyA g2r_tiled_copy_a;
+  ThrCopy g2r_thr_copy_a = g2r_tiled_copy_a.get_slice(tid);
+  Tensor tAgA = g2r_thr_copy_a.retile_S(tCgA);     // (CPY, CPY_M, CPY_K)
+  Tensor tArA = g2r_thr_copy_a.retile_D(tCrA);     // (CPY, CPY_M, CPY_K)
 
-  copy(copy_atom, tCgA, tCrA);
-  copy(copy_atom, tCgB, tCrB);
+  TiledCopyB g2r_tiled_copy_b;
+  ThrCopy g2r_thr_copy_b = g2r_tiled_copy_b.get_slice(tid);
+  Tensor tBgB = g2r_thr_copy_b.retile_S(tCgB);   // (CPY, CPY_N, CPY_K)
+  Tensor tBrB = g2r_thr_copy_b.retile_D(tCrB);   // (CPY, CPY_N, CPY_K)
 
-  if constexpr (IsGemm) clear(tCrC);  // Set the accumulators to zero
-  else copy(copy_atom, tCgC, tCrC);
+  TiledCopyC g2r_tiled_copy_c;
+  ThrCopy g2r_thr_copy_c = g2r_tiled_copy_c.get_slice(tid);
+  Tensor tCgC_g2r = g2r_thr_copy_c.retile_S(tCgC);   // (CPY, CPY_M, CPY_N)
+  Tensor tCrC_g2r = g2r_thr_copy_c.retile_D(tCrC);   // (CPY, CPY_M, CPY_N)
+
+  // if (thread0()) {
+  //   print(tCgA); printf("\n");
+  //   print(tCgB); printf("\n");
+  //   print(tCgC); printf("\n");
+  //   print(tCrA); printf("\n");
+  //   print(tCrB); printf("\n");
+  //   print(tCrC); printf("\n");
+  //   print(tAgA); printf("\n");
+  //   print(tArA); printf("\n");
+  //   print(tBgB); printf("\n");
+  //   print(tBrB); printf("\n");
+  //   print(tCgC_g2r); printf("\n");
+  //   print(tCrC_g2r); printf("\n");
+  // }
+
+  if constexpr (IsGemm) {
+    clear(tCrC);  // Set the accumulators to zero
+  } else {
+    copy(g2r_tiled_copy_c, tCgC_g2r, tCrC_g2r);
+  }
+
+#if 1
+  copy(g2r_tiled_copy_a, tAgA, tArA);
+  copy(g2r_tiled_copy_b, tBgB, tBrB);
 
   gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
 
-  if constexpr (!IsCvtPrecision) {
-    copy(copy_atom, tCrC, tCgC);
-  } else {
-    auto tCrO = make_tensor_like<OutType>(tCrC);
-    copy(tCrC, tCrO);  // Convert precision
+#elif 1
+  constexpr int kMmaValExpandK = Spec::kMmaValExpandK;
+  constexpr int kMmaTileK = Spec::kMmaTileK;
 
-    Tensor tCgO = thr_mma.partition_C(gO);  // (MMA, MMA_M, MMA_N)
-    copy(copy_atom, tCrO, tCgO);
+  constexpr int NTilesK = kTileK / kMmaTileK;
 
-    // Equivalent to:
-    // Tensor tCgO = thr_mma.partition_C(gO);  // (MMA, MMA_M, MMA_N)
-    // copy(copy_atom, tCrC, tCgO);
+  #pragma unroll
+  for (int ik = 0; ik < NTilesK; ++ik) {
+    copy(g2r_tiled_copy_a, tAgA(_, _, ik), tArA(_, _, ik));
+    copy(g2r_tiled_copy_b, tBgB(_, _, ik), tBrB(_, _, ik));
 
-    // Equivalent to:
-    // Tensor tCgO = thr_mma.partition_C(gO);  // (MMA, MMA_M, MMA_K)
-    // Tensor tCrO = thr_mma.partition_fragment_C(gO);  // (MMA, MMA_M, MMA_N)
-    // copy(copy_atom, tCrC, tCrO);  // Convert precision
-    // copy(copy_atom, tCrO, tCgO);
+    // NOT Equivalent to:
+    // copy(tCgA(_, _, ik), tCrA(_, _, ik));
+    // copy(tCgB(_, _, ik), tCrB(_, _, ik));
 
+    #pragma unroll
+    for (int gk = ik * kMmaValExpandK; gk < (ik + 1) * kMmaValExpandK; ++gk) {
+      gemm(tiled_mma, tCrC, tCrA(_, _, gk), tCrB(_, _, gk), tCrC);
+    }
   }
-}
-
-namespace cute {
-
-struct SM90_16x8x32_F32E4M3E5M2F32_TN
-{
-  using DRegisters = float[4];
-  using ARegisters = uint32_t[4];
-  using BRegisters = uint32_t[2];
-  using CRegisters = float[4];
-
-  CUTE_HOST_DEVICE static void
-  fma(float         & d0, float         & d1, float         & d2, float         & d3,
-      uint32_t const& a0, uint32_t const& a1, uint32_t const& a2, uint32_t const& a3,
-      uint32_t const& b0, uint32_t const& b1,
-      float    const& c0, float    const& c1, float    const& c2, float    const& c3)
-  {
-#if defined(CUTE_ARCH_MMA_SM89_ENABLED)
-    asm volatile(
-      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e5m2.f32 "
-      "{%0,  %1,  %2,  %3},"
-      "{%4,  %5,  %6,  %7},"
-      "{%8,  %9},"
-      "{%10, %11, %12, %13};\n"
-      : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-      :  "r"(a0),  "r"(a1),  "r"(a2),  "r"(a3),
-         "r"(b0),  "r"(b1),
-         "f"(c0),  "f"(c1),  "f"(c2),  "f"(c3));
 #else
-    CUTE_INVALID_CONTROL_PATH("Attempting to use SM90_16x8x32_F32E4M3E5M2F32_TN without CUTE_ARCH_MMA_SM89_ENABLED");
-#endif
+  constexpr int kMmaValExpandM = Spec::kMmaValExpandM;
+  constexpr int kMmaValExpandN = Spec::kMmaValExpandN;
+  constexpr int kMmaValExpandK = Spec::kMmaValExpandK;
+
+  constexpr int kMmaTileM = Spec::kMmaTileM;
+  constexpr int kMmaTileN = Spec::kMmaTileN;
+  constexpr int kMmaTileK = Spec::kMmaTileK;
+
+  constexpr int NTilesM = kTileM / kMmaTileM;
+  constexpr int NTilesN = kTileN / kMmaTileN;
+  constexpr int NTilesK = kTileK / kMmaTileK;
+
+  #pragma unroll
+  for (int m_tile = 0; m_tile < NTilesM; ++m_tile) {
+    #pragma unroll
+    for (int n_tile = 0; n_tile < NTilesN; ++n_tile) {
+      #pragma unroll
+      for (int k_tile = 0; k_tile < NTilesK; ++k_tile) {
+        copy(g2r_tiled_copy_a, tAgA(_, m_tile, k_tile), tArA(_, m_tile, k_tile));
+        copy(g2r_tiled_copy_b, tBgB(_, n_tile, k_tile), tBrB(_, n_tile, k_tile));
+        #pragma unroll
+        for (int im = m_tile * kMmaValExpandM; im < (m_tile + 1) * kMmaValExpandM; ++im) {
+          #pragma unroll
+          for (int in = n_tile * kMmaValExpandN; in < (n_tile + 1) * kMmaValExpandN; ++in) {
+            #pragma unroll
+            for (int ik = k_tile * kMmaValExpandK; ik < (k_tile + 1) * kMmaValExpandK; ++ik) {
+              gemm(tiled_mma, tCrC(_, im, in), tCrA(_, im, ik), tCrB(_, in, ik), tCrC(_, im, in));
+            }
+          }
+        }
+      }
+    }
   }
-};
+#endif
 
-template <>
-struct MMA_Traits<SM90_16x8x32_F32E4M3E5M2F32_TN>
-{
-  using ValTypeD = float;
-  using ValTypeA = float_e4m3_t;
-  using ValTypeB = float_e5m2_t;
-  using ValTypeC = float;
+  if constexpr (!IsCvtPrecision) {
+    TiledCopyC r2g_tiled_copy_c;
+    ThrCopy r2g_thr_copy_c = r2g_tiled_copy_c.get_slice(tid);
+    Tensor tCrC_r2g = r2g_thr_copy_c.retile_S(tCrC);   // (CPY, CPY_M, CPY_N)
+    Tensor tCgC_r2g = r2g_thr_copy_c.retile_D(tCgC);   // (CPY, CPY_M, CPY_N)  
+    copy(r2g_tiled_copy_c, tCrC_r2g, tCgC_r2g);
+  } else {
+    Tensor tCgO = thr_mma.partition_C(gO);  // (MMA, MMA_M, MMA_N)
+    auto t = make_tensor_like<OutType>(tCrC);
+    copy(tCrC, t);  // Convert precision
 
-  using Shape_MNK = Shape<_16,_8,_32>;
-  using ThrID   = Layout<_32>;
-  using ALayout = Layout<Shape <Shape < _4,_8>,Shape < _4,_2,  _2>>,
-                         Stride<Stride<_64,_1>,Stride<_16,_8,_256>>>;
-  using BLayout = Layout<Shape <Shape < _4,_8>,Shape <_4,  _2>>,
-                         Stride<Stride<_32,_1>,Stride<_8,_128>>>;
-  using CLayout = Layout<Shape <Shape < _4,_8>,Shape < _2,_2>>,
-                         Stride<Stride<_32,_1>,Stride<_16,_8>>>;
-};
-
+    TiledCopyO r2g_tiled_copy_o;
+    ThrCopy r2g_thr_copy_o = r2g_tiled_copy_o.get_slice(tid);
+    Tensor tOrC_r2g = r2g_thr_copy_o.retile_S(t);     // (CPY, CPY_M, CPY_N)
+    Tensor tOgO_r2g = r2g_thr_copy_o.retile_D(tCgO);  // (CPY, CPY_M, CPY_N)  
+    copy(r2g_tiled_copy_o, tOrC_r2g, tOgO_r2g);
+  }
 }
 
 namespace spec {
@@ -158,7 +186,7 @@ namespace spec {
 using namespace cute;
 
 template <typename OutType_, typename ComputeTypeA_, typename ComputeTypeB_, typename ComputeTypeC_,
-          int kTileM_ = 16, int kTileN_ = 8, int kTileK_ = 8>
+          int kTileM_ = 128, int kTileN_ = 128, int kTileK_ = 64>
 struct KernelSpec {
   using OutType = OutType_;
   using ComputeTypeA = ComputeTypeA_;
@@ -169,23 +197,43 @@ struct KernelSpec {
   static constexpr int kTileN = kTileN_;
   static constexpr int kTileK = kTileK_;
 
-  using MMA_op = std::conditional_t<
-    std::is_same_v<ComputeTypeA, bfloat16_t> &&
-    std::is_same_v<ComputeTypeB, bfloat16_t> &&
-    std::is_same_v<ComputeTypeC, float>,
-    SM80_16x8x8_F32BF16BF16F32_TN,
-    std::conditional_t<
-      std::is_same_v<ComputeTypeA, float_e4m3_t> &&
-      std::is_same_v<ComputeTypeB, float_e5m2_t> &&
-      std::is_same_v<ComputeTypeC, float>,
-      SM90_16x8x32_F32E4M3E5M2F32_TN,
-      void
-    >
-  >;
+  using MMA_op = SM80_16x8x16_F32BF16BF16F32_TN;
+  using MMA_traits = MMA_Traits<MMA_op>;
+  using MMA_atom = MMA_Atom<MMA_traits>;
+  using MMA_shape = MMA_traits::Shape_MNK;
 
-  static_assert(!std::is_same_v<MMA_op, void>, "Unsupported MMA op!");
+  static constexpr int kMmaThrExpandM = 2;
+  static constexpr int kMmaThrExpandN = 4;
+  static constexpr int kMmaThrExpandK = 1;
 
-  using TiledMMA = decltype(make_tiled_mma(MMA_op{}));
+  static constexpr int kMmaValExpandM = 1;
+  static constexpr int kMmaValExpandN = 1;
+  static constexpr int kMmaValExpandK = 2;
+
+  static constexpr int kMmaTileM = kMmaThrExpandM * kMmaValExpandM * get<0>(MMA_shape{});
+  static constexpr int kMmaTileN = kMmaThrExpandN * kMmaValExpandN * get<1>(MMA_shape{});
+  static constexpr int kMmaTileK = kMmaThrExpandK * kMmaValExpandK * get<2>(MMA_shape{});
+
+  using MMAThrLayout = decltype(make_layout(make_shape(Int<kMmaThrExpandM>{},
+                                                       Int<kMmaThrExpandN>{},
+                                                       Int<kMmaThrExpandK>{})));
+  using MMATileLayout = Tile<Int<kMmaTileM>,
+                             Int<kMmaTileN>,
+                             Int<kMmaTileK>>;
+
+  using TiledMMA = decltype(make_tiled_mma(MMA_op{}, MMAThrLayout{}, MMATileLayout{}));
+
+  using Copy_op = AutoVectorizingCopy;
+
+  using CopyA_atom = Copy_Atom<Copy_op, ComputeTypeA>;
+  using CopyB_atom = Copy_Atom<Copy_op, ComputeTypeB>;
+  using CopyC_atom = Copy_Atom<Copy_op, ComputeTypeC>;
+  using CopyO_atom = Copy_Atom<Copy_op, OutType>;
+
+  using TiledCopyA = decltype(make_tiled_copy_A(CopyA_atom{}, TiledMMA{}));
+  using TiledCopyB = decltype(make_tiled_copy_B(CopyB_atom{}, TiledMMA{}));
+  using TiledCopyC = decltype(make_tiled_copy_C(CopyC_atom{}, TiledMMA{}));
+  using TiledCopyO = decltype(make_tiled_copy_C(CopyO_atom{}, TiledMMA{}));
 
   static constexpr int kThreadNum = size(TiledMMA{});
   static constexpr int kShmSize = 0;
@@ -250,7 +298,7 @@ constexpr bool needs_precision_conversion() {
 template<int M, int N, int K, typename OutType,
          typename ComputeTypeA, typename ComputeTypeB, typename ComputeTypeC = OutType>
 torch::Tensor
-run_mixed_precision_gemm(const torch::Tensor a,
+run_block_mma(const torch::Tensor a,
                          const torch::Tensor b,
                          std::optional<torch::Tensor> _c) {
 
@@ -294,8 +342,6 @@ run_mixed_precision_gemm(const torch::Tensor a,
 
   using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, M, N, K>;
 
-  // cute::print(typename Spec::TiledMMA{});
-
   dim3 block = Spec::kThreadNum;
   dim3 grid((N + Spec::kTileN - 1) / Spec::kTileN,
             (M + Spec::kTileM - 1) / Spec::kTileM);
@@ -308,17 +354,17 @@ run_mixed_precision_gemm(const torch::Tensor a,
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
+  cudaDeviceSynchronize();
+
   auto get_data_ptr = [](const torch::Tensor& tensor) -> void* {
       return tensor.defined() ? tensor.data_ptr() : nullptr;
   };
   void *out_ptr = get_data_ptr(out);
 
-  cudaDeviceSynchronize();
-
   // Kernel launch
   BOOL_SWITCH(is_gemm, IsGemm, [&] {
     cudaEventRecord(start, stream);
-    mixed_precision_gemm<Spec, IsGemm, IsCvtPrecision>
+    block_mma<Spec, IsGemm, IsCvtPrecision>
     <<<grid, block, shm_size, stream>>>(
       c.data_ptr(), a.data_ptr(), b.data_ptr(),
       M, N, K, out_ptr
@@ -347,8 +393,5 @@ run_mixed_precision_gemm(const torch::Tensor a,
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("mixed_precision_gemm_fp32_bf16_bf16_fp32", &(run_mixed_precision_gemm<16, 8, 8, float, cute::bfloat16_t, cute::bfloat16_t>), "Run a mixed-precision 16x8x8 MMA operation.");
-  m.def("mixed_precision_gemm_bf16_bf16_bf16_fp32", &(run_mixed_precision_gemm<16, 8, 8, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t, float>), "Run a mixed-precision 16x8x8 MMA operation.");
-  m.def("mixed_precision_gemm_fp32_e4m3_e5m2_fp32", &(run_mixed_precision_gemm<16, 8, 32, float, cute::float_e4m3_t, cute::float_e5m2_t>), "Run a mixed-precision fp8 16x8x32 MMA operation.");
-  m.def("mixed_precision_gemm_bf16_e4m3_e5m2_fp32", &(run_mixed_precision_gemm<16, 8, 32, cute::bfloat16_t, cute::float_e4m3_t, cute::float_e5m2_t, float>), "Run a mixed-precision fp8 16x8x32 MMA operation.");
+  m.def("block_mma_bf16_bf16_bf16_fp32", &(run_block_mma<128, 128, 64, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t, float>), "Run a mixed-precision half 16x8x8 MMA operation.");
 }
