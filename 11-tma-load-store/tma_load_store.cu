@@ -470,8 +470,8 @@ run_tma_load_store(const torch::Tensor a, const torch::Tensor b, std::optional<t
   dim3 grid(cute::ceil_div(N, Spec::kTileN), cute::ceil_div(M, Spec::kTileM));
   int shm_size = Spec::kShmSize;
 
-  printf("block = (%d, %d), grid = (%d, %d), shm = %d\n",
-          block.x, block.y, grid.x, grid.y, shm_size);
+  printf("Block Size: (%d, %d, %d) | Grid Size: (%d, %d, %d) | Shared Memory Size: %d Bytes\n",
+          block.x, block.y, block.z, grid.x, grid.y, grid.z, shm_size);
 
   ////////////////////////////////////////////////////////////////////////////////////
   ////////////////////////////////// TMA Specific Code ///////////////////////////////
