@@ -1,6 +1,6 @@
 # CUTLASS Notes
 
-The CUTLASS notes series will begin with a minimal Minimal GEMM implementation, gradually expand to incorporate CuTe and various CUTLASS components, as well as features of new architectures like Hopper and Blackwell, ultimately achieving a high-performance fused GEMM operator.
+The CUTLASS notes series will begin with a minimal GEMM implementation, gradually expand to incorporate CuTe and various CUTLASS components, as well as features of new architectures, e.g. Hopper and Blackwell, ultimately achieving a high-performance fused GEMM operator.
 
 
 ## Usage
