@@ -515,7 +515,7 @@ run_tma_load_store(const torch::Tensor a, const torch::Tensor b, std::optional<t
     cudaEventRecord(start, stream);
     cudaFuncSetAttribute(tma_load_store<Spec, IsGemm, decltype(tma_A), decltype(tma_B), decltype(tma_C), decltype(tma_D)>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-    tma_load_store<Spec, IsGemm><<<grid, block, shm_size>>>(
+    tma_load_store<Spec, IsGemm><<<grid, block, shm_size, stream>>>(
       tma_A, tma_B, tma_C, tma_D, M, N, K
     );
     cudaEventRecord(stop, stream);

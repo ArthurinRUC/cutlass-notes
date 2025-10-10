@@ -595,7 +595,7 @@ run_dynamic_mma(const torch::Tensor a, const torch::Tensor b, std::optional<torc
     cudaFuncSetAttribute(dynamic_mma<Spec, IsGemm, IsCvtPrecision>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     dynamic_mma<Spec, IsGemm, IsCvtPrecision>
-    <<<grid, block, shm_size>>>(
+    <<<grid, block, shm_size, stream>>>(
       c.data_ptr(), a.data_ptr(), b.data_ptr(),
       M, N, K, out_ptr
     );
