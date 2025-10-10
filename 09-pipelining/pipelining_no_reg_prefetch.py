@@ -33,6 +33,7 @@ lib = load(
         "--generate-line-info",  # show PTX and SASS in ncu
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
         "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # For PDL
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100",  # For PDL
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted
         "-Xfatbin",  # compress all binary sections

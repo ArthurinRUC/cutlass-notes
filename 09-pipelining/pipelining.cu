@@ -645,7 +645,7 @@ run_pipelining(const torch::Tensor a, const torch::Tensor b, std::optional<torch
     cudaFuncSetAttribute(pipelining<Spec, IsGemm, IsCvtPrecision>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     pipelining<Spec, IsGemm, IsCvtPrecision>
-    <<<grid, block, shm_size>>>(
+    <<<grid, block, shm_size, stream>>>(
       c.data_ptr(), a.data_ptr(), b.data_ptr(),
       M, N, K, out_ptr
     );

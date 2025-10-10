@@ -608,13 +608,13 @@ run_warpgroup_mma(const torch::Tensor a, const torch::Tensor b, std::optional<to
 #if USE_CUTLASS_LAUNCHER
     void* kernel_ptr = (void *) &warpgroup_mma<Spec, IsGemm, use_tma_store_reduce_add, decltype(tma_A), decltype(tma_B), decltype(tma_C), decltype(tma_D)>;
     cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-    cutlass::launch_kernel_on_cluster({grid, block, cluster, shm_size},
+    cutlass::launch_kernel_on_cluster({grid, block, cluster, shm_size, stream},
                                       kernel_ptr,
                                       tma_A, tma_B, tma_C, tma_D, M, N, K);
 #else
     cudaFuncSetAttribute(warpgroup_mma<Spec, IsGemm, use_tma_store_reduce_add, decltype(tma_A), decltype(tma_B), decltype(tma_C), decltype(tma_D)>,
                           cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-    warpgroup_mma<Spec, IsGemm, use_tma_store_reduce_add><<<grid, block, shm_size>>>(
+    warpgroup_mma<Spec, IsGemm, use_tma_store_reduce_add><<<grid, block, shm_size, stream>>>(
       tma_A, tma_B, tma_C, tma_D, M, N, K
     );
 #endif

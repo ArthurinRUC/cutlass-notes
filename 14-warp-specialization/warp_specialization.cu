@@ -676,7 +676,7 @@ run_warp_specialization(const torch::Tensor a, const torch::Tensor b, std::optio
     cudaEventRecord(start, stream);
     void* kernel_ptr = (void *) &warp_specialization<Spec, IsGemm, use_tma_store_reduce_add, decltype(tma_A), decltype(tma_B), decltype(tma_C), decltype(tma_D)>;
     cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-    cutlass::launch_kernel_on_cluster({grid, block, cluster, shm_size},
+    cutlass::launch_kernel_on_cluster({grid, block, cluster, shm_size, stream},
                                       kernel_ptr,
                                       tma_A, tma_B, tma_C, tma_D, M, N, K);
     cudaEventRecord(stop, stream);

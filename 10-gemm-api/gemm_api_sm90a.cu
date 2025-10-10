@@ -124,7 +124,7 @@ struct KernelSpec {
   using StrideC = typename Gemm::GemmKernel::StrideC;
   using StrideD = typename Gemm::GemmKernel::StrideD;
 
-  static void run(void *Aptr, void *Bptr, void *Cptr, void *Dptr, int M, int N, int K) {
+  static void run(void *Aptr, void *Bptr, void *Cptr, void *Dptr, int M, int N, int K, cudaStream_t stream = nullptr) {
     // Instantiate CUTLASS kernel depending on templates
     Gemm gemm;
 
@@ -161,7 +161,7 @@ struct KernelSpec {
     CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
 
     // Correctness / Warmup iteration
-    CUTLASS_CHECK(gemm.run());
+    CUTLASS_CHECK(gemm.run(stream));
   }
 };
 
