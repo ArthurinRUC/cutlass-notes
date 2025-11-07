@@ -161,7 +161,6 @@ tma_multicast_reduce(__grid_constant__ TMA_A const tma_A,
   Tensor tBsB_s2r = s2r_thr_copy_b.partition_S(sB);     // (CPY, CPY_M, CPY_K)
   Tensor tBrB_s2r = s2r_thr_copy_b.retile_D(tCrB);      // (CPY, CPY_M, CPY_K)
 
-
   //
   // MAINLOOP
   //
@@ -181,8 +180,11 @@ tma_multicast_reduce(__grid_constant__ TMA_A const tma_A,
   }
 
   // Ensure barrier init is complete on all CTAs
-  __syncthreads();
-  cluster_sync();
+  if constexpr (Spec::kClusterSize > 1) {
+    cluster_sync();
+  } else {
+    __syncthreads();
+  }
 
   for (int ik = 0; ik < NTilesK; ++ik) {
     if ((warp_idx == 0) && lane_predicate) {
@@ -200,8 +202,11 @@ tma_multicast_reduce(__grid_constant__ TMA_A const tma_A,
 
     gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC);
 
-    __syncthreads();
-    cluster_sync();  // Too slooooooooow!!
+    if constexpr (Spec::kClusterSize > 1) {
+      cluster_sync();
+    } else {
+      __syncthreads();
+    }
   }
 
   // Important!

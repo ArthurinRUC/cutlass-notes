@@ -136,7 +136,7 @@ struct KernelSpec {
   static constexpr int kTileN = kTileN_;
   static constexpr int kTileK = kTileK_;
 
-  using MMA_op = SM80_16x8x16_F32BF16BF16F32_TN;
+  using MMA_op = SM80_16x8x8_F32BF16BF16F32_TN;
   using MMA_traits = MMA_Traits<MMA_op>;
   using MMA_atom = MMA_Atom<MMA_traits>;
   using MMA_shape = MMA_traits::Shape_MNK;
@@ -147,7 +147,7 @@ struct KernelSpec {
 
   static constexpr int kMmaValExpandM = 1;
   static constexpr int kMmaValExpandN = 1;
-  static constexpr int kMmaValExpandK = 1;
+  static constexpr int kMmaValExpandK = 2;
 
   static constexpr int kMmaTileM = kMmaThrExpandM * kMmaValExpandM * get<0>(MMA_shape{});
   static constexpr int kMmaTileN = kMmaThrExpandN * kMmaValExpandN * get<1>(MMA_shape{});
