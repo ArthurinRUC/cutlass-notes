@@ -202,8 +202,11 @@ warpgroup_mma(__grid_constant__ TMA_A const tma_A,
   }
 
   // Make sure all threads across all CTAs in Cluster observe barrier initialization.
-  __syncthreads();
-  cluster_sync();
+  if constexpr (Spec::kClusterSize > 1) {
+    cluster_sync();
+  } else {
+    __syncthreads();
+  }
 
   #pragma unroll
   for (int pipe = 0; pipe < kStages; ++pipe) {
