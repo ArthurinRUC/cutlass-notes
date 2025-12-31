@@ -6,8 +6,7 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_run:
-      workflows: ["Code Quality Checks"]
-      types: [requested]
+    workflows: ["Code Quality Checks"]
 
 permissions:
   contents: write
