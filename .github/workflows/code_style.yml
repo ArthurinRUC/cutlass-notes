@@ -5,11 +5,28 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_run:
+    workflows: ["Code Quality Checks"]
+    types: [requested]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: write
 
 jobs:
   python-quality-check:
     name: Python Code Quality Check
     runs-on: ubuntu-latest
+
+    if: |
+      !(
+        github.event_name == 'push' && 
+        github.actor == 'github-actions[bot]' && 
+        (
+          github.event.commits[0].message contains 'style: auto-format Python'
+        )
+      )
     
     steps:
     - name: Checkout code
@@ -41,6 +58,7 @@ jobs:
 
         if git diff --quiet; then
           echo "No changes to commit after auto-fix"
+          echo "has_changes=false" >> $GITHUB_OUTPUT
           exit 0
         fi
 
@@ -48,10 +66,37 @@ jobs:
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
         git add -A
-        git commit -m "style: auto-format Python code with ruff [skip ci]"
+        git commit -m "style: auto-format Python code with ruff"
+        echo "has_changes=true" >> $GITHUB_OUTPUT
 
         echo "Pushing changes..."
         git push origin HEAD:${{ github.event.pull_request.head.ref || github.ref_name }}
+
+    - name: Comment on PR for Python fixes
+      if: steps.auto-fix-python.outcome == 'success' && fromJson(steps.auto-fix-python.outputs.has_changes)
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number
+          });
+          
+          const hasExistingComment = comments.some(comment => 
+            comment.user.login === 'github-actions[bot]' && 
+            comment.body.includes('Python formatting')
+          );
+          
+          if (!hasExistingComment) {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '✅ **Python Code Formatting Applied**\n\nI\'ve automatically formatted your Python code using `ruff`. The changes have been pushed to your branch. Please review the changes and update your PR if needed.'
+            });
+          }
 
     - name: Fail if Python check failed and not auto-fixed
       if: steps.python-check.outcome == 'failure' && (steps.auto-fix-python.outcome == 'failure' || github.event_name != 'pull_request')
@@ -63,6 +108,15 @@ jobs:
   cpp-quality-check:
     name: C++ Code Quality Check
     runs-on: ubuntu-latest
+    
+    if: |
+      !(
+        github.event_name == 'push' && 
+        github.actor == 'github-actions[bot]' && 
+        (
+          github.event.commits[0].message contains 'style: auto-format C++'
+        )
+      )
     
     steps:
     - name: Checkout code
@@ -94,6 +148,7 @@ jobs:
         
         if git diff --quiet; then
           echo "No changes to commit after auto-fix"
+          echo "has_changes=false" >> $GITHUB_OUTPUT
           exit 0
         fi
         
@@ -101,10 +156,37 @@ jobs:
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
         git add -A
-        git commit -m "style: auto-format C++ code with clang-format [skip ci]"
+        git commit -m "style: auto-format C++ code with clang-format"
+        echo "has_changes=true" >> $GITHUB_OUTPUT
         
         echo "Pushing changes..."
         git push origin HEAD:${{ github.event.pull_request.head.ref || github.ref_name }}
+
+    - name: Comment on PR for C++ fixes
+      if: steps.auto-fix-cpp.outcome == 'success' && fromJson(steps.auto-fix-cpp.outputs.has_changes)
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number
+          });
+  
+          const hasExistingComment = comments.some(comment => 
+            comment.user.login === 'github-actions[bot]' && 
+            comment.body.includes('C++ formatting')
+          );
+          
+          if (!hasExistingComment) {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '✅ **C++ Code Formatting Applied**\n\nI\'ve automatically formatted your C++ code using `clang-format`. The changes have been pushed to your branch. Please review the changes and update your PR if needed.'
+            });
+          }
 
     - name: Fail if C++ check failed and not auto-fixed
       if: steps.cpp-check.outcome == 'failure' && (steps.auto-fix-cpp.outcome == 'failure' || github.event_name != 'pull_request')
@@ -112,3 +194,38 @@ jobs:
         echo "C++ quality check failed"
         echo "For PRs, auto-fix was attempted. Check the auto-fix step for details."
         exit 1
+
+  summary-comment:
+    name: Formatting Summary
+    needs: [python-quality-check, cpp-quality-check]
+    if: github.event_name == 'pull_request' && (needs.python-quality-check.outputs.has_changes == 'true' || needs.cpp-quality-check.outputs.has_changes == 'true')
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Post formatting summary
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const pythonFixed = "${{ needs.python-quality-check.outputs.has_changes }}" === 'true';
+          const cppFixed = "${{ needs.cpp-quality-check.outputs.has_changes }}" === 'true';
+          
+          let summary = '## 📝 Formatting Summary\n\n';
+          
+          if (pythonFixed && cppFixed) {
+            summary += '✅ Both Python and C++ code have been automatically formatted.\n';
+            summary += '✅ All formatting issues are now resolved.';
+          } else if (pythonFixed) {
+            summary += '✅ Python code has been automatically formatted.\n';
+            summary += '✅ C++ code passed formatting checks without changes.';
+          } else if (cppFixed) {
+            summary += '✅ C++ code has been automatically formatted.\n';
+            summary += '✅ Python code passed formatting checks without changes.';
+          }
+          
+          await github.rest.issues.createComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+            body: summary
+          });
