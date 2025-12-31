@@ -16,14 +16,14 @@ jobs:
     name: Python Code Quality Check
     runs-on: ubuntu-latest
 
-    if: |
-      !(
-        github.event_name == 'push' && 
-        github.actor == 'github-actions[bot]' && 
-        (
-          github.event.commits[0].message contains 'style: auto-format Python'
-        )
-      )
+    # if: |
+    #   !(
+    #     github.event_name == 'push' && 
+    #     github.actor == 'github-actions[bot]' && 
+    #     (
+    #       github.event.commits[0].message contains 'style: auto-format Python'
+    #     )
+    #   )
     
     steps:
     - name: Checkout code
@@ -106,14 +106,14 @@ jobs:
     name: C++ Code Quality Check
     runs-on: ubuntu-latest
     
-    if: |
-      !(
-        github.event_name == 'push' && 
-        github.actor == 'github-actions[bot]' && 
-        (
-          github.event.commits[0].message contains 'style: auto-format C++'
-        )
-      )
+    # if: |
+    #   !(
+    #     github.event_name == 'push' && 
+    #     github.actor == 'github-actions[bot]' && 
+    #     (
+    #       github.event.commits[0].message contains 'style: auto-format C++'
+    #     )
+    #   )
     
     steps:
     - name: Checkout code
