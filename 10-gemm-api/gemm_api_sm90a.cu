@@ -1,121 +1,135 @@
-#include <cuda_runtime.h>
-#include <cute/tensor.hpp>
 #include "cutlass/cutlass.h"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
-#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include <cuda_runtime.h>
+#include <cute/tensor.hpp>
 
 #include "cutlass/util/host_tensor.h"
 #include "cutlass/util/packed_stride.hpp"
 
-#include <torch/types.h>
-#include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <torch/extension.h>
+#include <torch/types.h>
 
-
-#define CUTLASS_CHECK(status)                                                                    \
-  {                                                                                              \
-    cutlass::Status error = status;                                                              \
-    if (error != cutlass::Status::kSuccess) {                                                    \
-      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: " << __LINE__ \
-                << std::endl;                                                                    \
-      exit(EXIT_FAILURE);                                                                        \
-    }                                                                                            \
+#define CUTLASS_CHECK(status)                                                                                         \
+  {                                                                                                                   \
+    cutlass::Status error = status;                                                                                   \
+    if (error != cutlass::Status::kSuccess) {                                                                         \
+      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: " << __LINE__ << std::endl;        \
+      exit(EXIT_FAILURE);                                                                                             \
+    }                                                                                                                 \
   }
-
 
 namespace spec {
 
 using namespace cute;
 
-template <typename OutType_, typename ComputeTypeA_, typename ComputeTypeB_, typename ComputeTypeC_, 
-          typename AccType_, int kTileM_, int kTileN_, int kTileK_>
+template <typename OutType_,
+          typename ComputeTypeA_,
+          typename ComputeTypeB_,
+          typename ComputeTypeC_,
+          typename AccType_,
+          int kTileM_,
+          int kTileN_,
+          int kTileK_>
 struct KernelSpec {
   // A matrix configuration
-  using                ElementA    = ComputeTypeA_;
-  using                LayoutA     = cutlass::layout::RowMajor;
-  static constexpr int AlignmentA  = 16 / sizeof(ElementA);
+  using ElementA = ComputeTypeA_;
+  using LayoutA = cutlass::layout::RowMajor;
+  static constexpr int AlignmentA = 16 / sizeof(ElementA);
   // static constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;
 
   // B matrix configuration
-  using                ElementB    = ComputeTypeB_;
-  using                LayoutB     = cutlass::layout::ColumnMajor;
-  static constexpr int AlignmentB  = 16 / sizeof(ElementB);
+  using ElementB = ComputeTypeB_;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  static constexpr int AlignmentB = 16 / sizeof(ElementB);
 
   // C/D matrix configuration
-  using                ElementC    = ComputeTypeC_;
-  using                LayoutC     = cutlass::layout::RowMajor;
-  static constexpr int AlignmentC  = 16 / sizeof(ElementC);
+  using ElementC = ComputeTypeC_;
+  using LayoutC = cutlass::layout::RowMajor;
+  static constexpr int AlignmentC = 16 / sizeof(ElementC);
 
-  using                ElementD    = OutType_;
-  using                LayoutD     = cutlass::layout::RowMajor;
-  static constexpr int AlignmentD  = 16 / sizeof(ElementD);
+  using ElementD = OutType_;
+  using LayoutD = cutlass::layout::RowMajor;
+  static constexpr int AlignmentD = 16 / sizeof(ElementD);
 
   // Core kernel configurations
-  using ElementAccumulator  = AccType_;
-  using ElementCompute      = AccType_;
-  using ArchTag             = cutlass::arch::Sm90;
-  using OperatorClass       = cutlass::arch::OpClassTensorOp;
-  using TileShape           = Shape<Int<kTileM_>,Int<kTileN_>,Int<kTileK_>>;
-  using ClusterShape        = Shape<_2,_1,_1>;
-  using StageCount          = cutlass::gemm::collective::StageCountAuto;
-  using KernelSchedule      = cutlass::gemm::collective::KernelScheduleAuto;
-  using EpilogueTile        = cutlass::epilogue::collective::EpilogueTileAuto;
-  using EpilogueSchedule    = cutlass::epilogue::collective::EpilogueScheduleAuto;
-  using FusionOperation     = cutlass::epilogue::fusion::LinearCombination<ElementD,ElementCompute,ElementC,ElementCompute>;
-  using TileScheduler       = cutlass::gemm::PersistentScheduler;
+  using ElementAccumulator = AccType_;
+  using ElementCompute = AccType_;
+  using ArchTag = cutlass::arch::Sm90;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+  using TileShape = Shape<Int<kTileM_>, Int<kTileN_>, Int<kTileK_>>;
+  using ClusterShape = Shape<_2, _1, _1>;
+  using StageCount = cutlass::gemm::collective::StageCountAuto;
+  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+  using EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto;
+  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+  using FusionOperation =
+      cutlass::epilogue::fusion::LinearCombination<ElementD, ElementCompute, ElementC, ElementCompute>;
+  using TileScheduler = cutlass::gemm::PersistentScheduler;
 
-// template <
-//   class ArchTag, class OpClass,
-//   class TileShape_MNK, class ClusterShape_MNK,
-//   class EpilogueTileType,
-//   class ElementAccumulator, class ElementCompute,
-//   class ElementC, class GmemLayoutTagC, int AlignmentC,
-//   class ElementD, class GmemLayoutTagD, int AlignmentD,
-//   class EpilogueScheduleType,
-//   class FusionOpOrCallbacks = cutlass::epilogue::fusion::LinearCombination<ElementD,ElementCompute,ElementC,ElementCompute>,
-//   class Enable = void
-// >
-  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag, OperatorClass,
-      TileShape, ClusterShape,
-      EpilogueTile,
-      ElementAccumulator, ElementCompute,
-      ElementC, LayoutC, AlignmentC,
-      ElementD, LayoutD, AlignmentD,
-      EpilogueSchedule,
-      FusionOperation
-    >::CollectiveOp;
+  // template <
+  //   class ArchTag, class OpClass,
+  //   class TileShape_MNK, class ClusterShape_MNK,
+  //   class EpilogueTileType,
+  //   class ElementAccumulator, class ElementCompute,
+  //   class ElementC, class GmemLayoutTagC, int AlignmentC,
+  //   class ElementD, class GmemLayoutTagD, int AlignmentD,
+  //   class EpilogueScheduleType,
+  //   class FusionOpOrCallbacks =
+  //   cutlass::epilogue::fusion::LinearCombination<ElementD,ElementCompute,ElementC,ElementCompute>, class Enable =
+  //   void
+  // >
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag,
+                                                                                       OperatorClass,
+                                                                                       TileShape,
+                                                                                       ClusterShape,
+                                                                                       EpilogueTile,
+                                                                                       ElementAccumulator,
+                                                                                       ElementCompute,
+                                                                                       ElementC,
+                                                                                       LayoutC,
+                                                                                       AlignmentC,
+                                                                                       ElementD,
+                                                                                       LayoutD,
+                                                                                       AlignmentD,
+                                                                                       EpilogueSchedule,
+                                                                                       FusionOperation>::CollectiveOp;
 
-// template <
-//   class ArchTag, class OpClass,
-//   class ElementA, class GmemLayoutA, int AlignmentA,
-//   class ElementB, class GmemLayoutB, int AlignmentB,
-//   class ElementAccumulator,
-//   class TileShape_MNK, class ClusterShape_MNK,
-//   class StageCountType,
-//   class KernelScheduleType,
-//   class Enable = void
-// >
+  // template <
+  //   class ArchTag, class OpClass,
+  //   class ElementA, class GmemLayoutA, int AlignmentA,
+  //   class ElementB, class GmemLayoutB, int AlignmentB,
+  //   class ElementAccumulator,
+  //   class TileShape_MNK, class ClusterShape_MNK,
+  //   class StageCountType,
+  //   class KernelScheduleType,
+  //   class Enable = void
+  // >
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, OperatorClass,
-      ElementA, LayoutA, AlignmentA,
-      ElementB, LayoutB, AlignmentB,
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      LayoutA,
+      AlignmentA,
+      ElementB,
+      LayoutB,
+      AlignmentB,
       ElementAccumulator,
-      TileShape, ClusterShape,
+      TileShape,
+      ClusterShape,
       conditional_t<cute::is_same_v<StageCount, cutlass::gemm::collective::StageCountAuto>,
-          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          StageCount>,
-      KernelSchedule
-    >::CollectiveOp;
+                    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+                        sizeof(typename CollectiveEpilogue::SharedStorage))>,
+                    StageCount>,
+      KernelSchedule>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int,int,int>, // Indicates ProblemShape
-      CollectiveMainloop,
-      CollectiveEpilogue,
-      TileScheduler
-  >;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int>, // Indicates ProblemShape
+                                                          CollectiveMainloop,
+                                                          CollectiveEpilogue,
+                                                          TileScheduler>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
@@ -139,14 +153,14 @@ struct KernelSpec {
     // Change device_id to another value if you are running on a machine with multiple GPUs and wish
     // to use a GPU other than that with device ID 0.
     int device_id = 0;
-    cutlass::KernelHardwareInfo kernel_hw_info = cutlass::KernelHardwareInfo::make_kernel_hardware_info<typename Gemm::GemmKernel>(device_id);
+    cutlass::KernelHardwareInfo kernel_hw_info =
+        cutlass::KernelHardwareInfo::make_kernel_hardware_info<typename Gemm::GemmKernel>(device_id);
     typename Gemm::Arguments arguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {M, N, K},
-      {(ElementA *)Aptr, stride_A, (ElementB *)Bptr, stride_B},
-      {{(ElementAccumulator)1.f, (ElementAccumulator)1.f}, (ElementC *)Cptr, stride_C, (ElementD *)Dptr, stride_D},
-      kernel_hw_info
-    };
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K},
+        {(ElementA *)Aptr, stride_A, (ElementB *)Bptr, stride_B},
+        {{(ElementAccumulator)1.f, (ElementAccumulator)1.f}, (ElementC *)Cptr, stride_C, (ElementD *)Dptr, stride_D},
+        kernel_hw_info};
 
     // Using the arguments, query for extra workspace required for matrix multiplication computation
     size_t workspace_size = Gemm::get_workspace_size(arguments);
@@ -165,57 +179,55 @@ struct KernelSpec {
   }
 };
 
-}  // namespace spec
+} // namespace spec
 
-
-#define CHECK_TORCH_TENSOR_DTYPE(T, DTYPE)                       \
-  do {                                                           \
-    if ((T).options().dtype() != (DTYPE)) {                      \
-      std::cerr << "Tensor dtype mismatch! Expected: "           \
-                << (DTYPE) << ", but got: "                      \
-                << (T).options().dtype()                         \
-                << " at " << __FILE__                            \
-                << ":" << __LINE__ << std::endl;                 \
-      std::exit(EXIT_FAILURE);                                   \
-    }                                                            \
+#define CHECK_TORCH_TENSOR_DTYPE(T, DTYPE)                                                                            \
+  do {                                                                                                                \
+    if ((T).options().dtype() != (DTYPE)) {                                                                           \
+      std::cerr << "Tensor dtype mismatch! Expected: " << (DTYPE) << ", but got: " << (T).options().dtype() << " at " \
+                << __FILE__ << ":" << __LINE__ << std::endl;                                                          \
+      std::exit(EXIT_FAILURE);                                                                                        \
+    }                                                                                                                 \
   } while (0);
 
-#define CHECK_TORCH_TENSOR_SHAPE(T, M, N)                        \
-  do {                                                           \
-    auto actual_shape = (T).sizes();                             \
-    if (actual_shape != torch::IntArrayRef({M, N})) {            \
-      std::cerr << "Tensor shape mismatch! Expected: "           \
-                << torch::IntArrayRef({M, N})                    \
-                << ", but got: " << actual_shape                 \
-                << " at " << __FILE__                            \
-                << ":" << __LINE__ << std::endl;                 \
-      std::exit(EXIT_FAILURE);                                   \
-    }                                                            \
+#define CHECK_TORCH_TENSOR_SHAPE(T, M, N)                                                                             \
+  do {                                                                                                                \
+    auto actual_shape = (T).sizes();                                                                                  \
+    if (actual_shape != torch::IntArrayRef({M, N})) {                                                                 \
+      std::cerr << "Tensor shape mismatch! Expected: " << torch::IntArrayRef({M, N}) << ", but got: " << actual_shape \
+                << " at " << __FILE__ << ":" << __LINE__ << std::endl;                                                \
+      std::exit(EXIT_FAILURE);                                                                                        \
+    }                                                                                                                 \
   } while (0);
 
-
-template <typename T>
-constexpr torch::ScalarType to_torch_scalar_type() {
-    if constexpr (std::is_same_v<T, cute::half_t>) return torch::kHalf;
-    else if constexpr (std::is_same_v<T, cute::bfloat16_t>) return torch::kBFloat16;
-    else if constexpr (std::is_same_v<T, float>) return torch::kFloat32;
-    else if constexpr (std::is_same_v<T, cute::float_e4m3_t>) return torch::kFloat8_e4m3fn;
-    else if constexpr (std::is_same_v<T, cute::float_e5m2_t>) return torch::kFloat8_e5m2;
-    else throw std::runtime_error("Unsupported type!");
+template <typename T> constexpr torch::ScalarType to_torch_scalar_type() {
+  if constexpr (std::is_same_v<T, cute::half_t>)
+    return torch::kHalf;
+  else if constexpr (std::is_same_v<T, cute::bfloat16_t>)
+    return torch::kBFloat16;
+  else if constexpr (std::is_same_v<T, float>)
+    return torch::kFloat32;
+  else if constexpr (std::is_same_v<T, cute::float_e4m3_t>)
+    return torch::kFloat8_e4m3fn;
+  else if constexpr (std::is_same_v<T, cute::float_e5m2_t>)
+    return torch::kFloat8_e5m2;
+  else
+    throw std::runtime_error("Unsupported type!");
 }
 
-
-template <typename ComputeTypeC, typename OutType>
-constexpr bool needs_precision_conversion() {
+template <typename ComputeTypeC, typename OutType> constexpr bool needs_precision_conversion() {
   return !std::is_same_v<ComputeTypeC, OutType>;
 }
 
-
-template<int kTileM, int kTileN, int kTileK,
-         typename OutType, typename ComputeTypeA, typename ComputeTypeB, 
-         typename ComputeTypeC = OutType, typename AccType = ComputeTypeC>
-torch::Tensor
-run_gemm_api(const torch::Tensor a, const torch::Tensor b, std::optional<torch::Tensor> _c) {
+template <int kTileM,
+          int kTileN,
+          int kTileK,
+          typename OutType,
+          typename ComputeTypeA,
+          typename ComputeTypeB,
+          typename ComputeTypeC = OutType,
+          typename AccType = ComputeTypeC>
+torch::Tensor run_gemm_api(const torch::Tensor a, const torch::Tensor b, std::optional<torch::Tensor> _c) {
 
   at::cuda::CUDAGuard device_guard{a.get_device()};
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -274,9 +286,8 @@ run_gemm_api(const torch::Tensor a, const torch::Tensor b, std::optional<torch::
 
   auto error = cudaGetLastError();
   if (error != cudaSuccess) {
-    throw std::runtime_error(
-      std::string("CUDA error: ") + cudaGetErrorString(error) +
-      " (error code: " + std::to_string(error) + ")");
+    throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(error) +
+                             " (error code: " + std::to_string(error) + ")");
   }
 
   float milliseconds = 0;
@@ -286,12 +297,18 @@ run_gemm_api(const torch::Tensor a, const torch::Tensor b, std::optional<torch::
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
 
-  if constexpr (IsCvtPrecision) return out;
-  else return c;
+  if constexpr (IsCvtPrecision)
+    return out;
+  else
+    return c;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("gemm_api_fp16_fp16_fp16_fp16", &(run_gemm_api<128, 128, 64, cute::half_t, cute::half_t, cute::half_t>), "Run a mixed-precision half 16x8x8 MMA operation.");
-  m.def("gemm_api_fp16_fp16_fp16_fp32", &(run_gemm_api<128, 128, 64, cute::half_t, cute::half_t, cute::half_t, float>), "Run a mixed-precision half 16x8x8 MMA operation.");
-  m.def("gemm_api_bf16_bf16_bf16_fp32", &(run_gemm_api<128, 128, 64, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t, float>), "Run a mixed-precision half 16x8x8 MMA operation.");
+  m.def("gemm_api_fp16_fp16_fp16_fp16", &(run_gemm_api<128, 128, 64, cute::half_t, cute::half_t, cute::half_t>),
+        "Run a mixed-precision half 16x8x8 MMA operation.");
+  m.def("gemm_api_fp16_fp16_fp16_fp32", &(run_gemm_api<128, 128, 64, cute::half_t, cute::half_t, cute::half_t, float>),
+        "Run a mixed-precision half 16x8x8 MMA operation.");
+  m.def("gemm_api_bf16_bf16_bf16_fp32",
+        &(run_gemm_api<128, 128, 64, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t, float>),
+        "Run a mixed-precision half 16x8x8 MMA operation.");
 }

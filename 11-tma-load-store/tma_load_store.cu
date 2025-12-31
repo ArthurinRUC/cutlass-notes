@@ -1,61 +1,54 @@
 #include <cuda_runtime.h>
-#include <cutlass/arch/barrier.h>
 #include <cute/tensor.hpp>
+#include <cutlass/arch/barrier.h>
 
-#include <torch/types.h>
-#include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
-
+#include <torch/extension.h>
+#include <torch/types.h>
 
 namespace cute {
 
 // Invalidate barrier present in shared memory
 CUTE_HOST_DEVICE
-void
-invalidate_barrier(uint64_t& smem_barrier)                 // 64 bits user-managed barrier in smem
+void invalidate_barrier(uint64_t &smem_barrier) // 64 bits user-managed barrier in smem
 {
 #if defined(CUTE_ARCH_TMA_SM90_ENABLED)
   uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_barrier);
-  asm volatile ("mbarrier.inval.shared::cta.b64 [%0];\n"
-                :: "r"(smem_int_ptr));
+  asm volatile("mbarrier.inval.shared::cta.b64 [%0];\n" ::"r"(smem_int_ptr));
 #elif defined(__CUDA_ARCH__)
-  asm volatile ("brkpt;\n" ::);
+  asm volatile("brkpt;\n" ::);
 #endif
 }
 
 } // namespace cute
 
-
 template <class ElementA,
           class ElementB,
-          class SmemLayoutA,  // (M,K)
-          class SmemLayoutB>  // (N,K)
-struct SharedStorage_AB
-{
+          class SmemLayoutA, // (M,K)
+          class SmemLayoutB> // (N,K)
+struct SharedStorage_AB {
   alignas(128) cute::ArrayEngine<ElementA, cute::cosize_v<SmemLayoutA>> A;
   alignas(128) cute::ArrayEngine<ElementB, cute::cosize_v<SmemLayoutB>> B;
 
   uint64_t tma_barrier[1];
 };
 
-
 template <class ElementC,
-          class SmemLayoutC>  // (M,N)
-struct SharedStorage_C
-{
+          class SmemLayoutC> // (M,N)
+struct SharedStorage_C {
   alignas(128) cute::ArrayEngine<ElementC, cute::cosize_v<SmemLayoutC>> C;
 
   uint64_t tma_barrier[1];
 };
 
-
 template <typename Spec, bool IsGemm, typename TMA_A, typename TMA_B, typename TMA_C, typename TMA_D>
-__global__ __launch_bounds__(Spec::kThreadNum) void
-tma_load_store(__grid_constant__ TMA_A const tma_A,
-               __grid_constant__ TMA_B const tma_B,
-               __grid_constant__ TMA_C const tma_C,
-               __grid_constant__ TMA_D const tma_D,
-               int M, int N, int K) {
+__global__ __launch_bounds__(Spec::kThreadNum) void tma_load_store(__grid_constant__ TMA_A const tma_A,
+                                                                   __grid_constant__ TMA_B const tma_B,
+                                                                   __grid_constant__ TMA_C const tma_C,
+                                                                   __grid_constant__ TMA_D const tma_D,
+                                                                   int M,
+                                                                   int N,
+                                                                   int K) {
   using namespace cute;
 
   using X = Underscore;
@@ -75,7 +68,7 @@ tma_load_store(__grid_constant__ TMA_A const tma_A,
   extern __shared__ __align__(1024) uint8_t smem_raw[];
 
   using SharedStorage = SharedStorage_AB<ComputeTypeA, ComputeTypeB, SmemLayoutA, SmemLayoutB>;
-  SharedStorage& smem = *reinterpret_cast<SharedStorage*>(smem_raw);
+  SharedStorage &smem = *reinterpret_cast<SharedStorage *>(smem_raw);
   // >=8-bit SMEM pointer
   auto *Aptr_smem = smem.A.begin();
   auto *Bptr_smem = smem.B.begin();
@@ -102,47 +95,46 @@ tma_load_store(__grid_constant__ TMA_A const tma_A,
   auto tiler = make_tile(Int<kTileM>{}, Int<kTileN>{}, Int<kTileK>{});
   auto coord = make_coord(bidy, bidx, _);
 
-  Tensor gA = local_tile(mA, tiler, coord, Step<_1,  X, _1>{});  // (BLK_M, BLK_K, K_TILES)
-  Tensor gB = local_tile(mB, tiler, coord, Step< X, _1, _1>{});  // (BLK_N, BLK_K, K_TILES)
-  Tensor gC = local_tile(mC, tiler, coord, Step<_1, _1,  X>{});  // (BLK_M, BLK_N)
-  Tensor gD = local_tile(mD, tiler, coord, Step<_1, _1,  X>{});  // (BLK_M, BLK_N)
+  Tensor gA = local_tile(mA, tiler, coord, Step<_1, X, _1>{}); // (BLK_M, BLK_K, K_TILES)
+  Tensor gB = local_tile(mB, tiler, coord, Step<X, _1, _1>{}); // (BLK_N, BLK_K, K_TILES)
+  Tensor gC = local_tile(mC, tiler, coord, Step<_1, _1, X>{}); // (BLK_M, BLK_N)
+  Tensor gD = local_tile(mD, tiler, coord, Step<_1, _1, X>{}); // (BLK_M, BLK_N)
 
-  Tensor sA = make_tensor(make_smem_ptr((ComputeTypeA *)Aptr_smem), SmemLayoutA{});  // (BLK_M, BLK_K)
-  Tensor sB = make_tensor(make_smem_ptr((ComputeTypeB *)Bptr_smem), SmemLayoutB{});  // (BLK_N, BLK_K)
-  Tensor sC = make_tensor(make_smem_ptr((ComputeTypeC *)Cptr_smem), SmemLayoutC{});  // (BLK_M, BLK_N)
-  Tensor sD = make_tensor(make_smem_ptr((OutType      *)Dptr_smem), SmemLayoutD{});  // (BLK_M, BLK_N)
+  Tensor sA = make_tensor(make_smem_ptr((ComputeTypeA *)Aptr_smem), SmemLayoutA{}); // (BLK_M, BLK_K)
+  Tensor sB = make_tensor(make_smem_ptr((ComputeTypeB *)Bptr_smem), SmemLayoutB{}); // (BLK_N, BLK_K)
+  Tensor sC = make_tensor(make_smem_ptr((ComputeTypeC *)Cptr_smem), SmemLayoutC{}); // (BLK_M, BLK_N)
+  Tensor sD = make_tensor(make_smem_ptr((OutType *)Dptr_smem), SmemLayoutD{});      // (BLK_M, BLK_N)
 
-  auto [tAgA, tAsA] = tma_partition(tma_A, Int<0>{}, Layout<_1>{},
-                                    group_modes<0,2>(sA), group_modes<0,2>(gA));  // (TMA,K_TILES) and (TMA)
-  auto [tBgB, tBsB] = tma_partition(tma_B, Int<0>{}, Layout<_1>{},
-                                    group_modes<0,2>(sB), group_modes<0,2>(gB));  // (TMA,K_TILES) and (TMA)
-  auto [tCgC, tCsC] = tma_partition(tma_C, Int<0>{}, Layout<_1>{},
-                                    group_modes<0,2>(sC), group_modes<0,2>(gC));  // (TMA,K_TILES) and (TMA)
-  auto [tDgD, tDsD] = tma_partition(tma_D, Int<0>{}, Layout<_1>{},
-                                    group_modes<0,2>(sD), group_modes<0,2>(gD));  // (TMA,K_TILES) and (TMA)
+  auto [tAgA, tAsA] = tma_partition(tma_A, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(sA),
+                                    group_modes<0, 2>(gA)); // (TMA,K_TILES) and (TMA)
+  auto [tBgB, tBsB] = tma_partition(tma_B, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(sB),
+                                    group_modes<0, 2>(gB)); // (TMA,K_TILES) and (TMA)
+  auto [tCgC, tCsC] = tma_partition(tma_C, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(sC),
+                                    group_modes<0, 2>(gC)); // (TMA,K_TILES) and (TMA)
+  auto [tDgD, tDsD] = tma_partition(tma_D, Int<0>{}, Layout<_1>{}, group_modes<0, 2>(sD),
+                                    group_modes<0, 2>(gD)); // (TMA,K_TILES) and (TMA)
 
-  constexpr int tma_transaction_bytes = kTileM * kTileK * sizeof(ComputeTypeA)
-                                      + kTileN * kTileK * sizeof(ComputeTypeB);
+  constexpr int tma_transaction_bytes =
+      kTileM * kTileK * sizeof(ComputeTypeA) + kTileN * kTileK * sizeof(ComputeTypeB);
 
   typename Spec::TiledMMA tiled_mma;
   ThrMMA thr_mma = tiled_mma.get_slice(tid);
 
   // Note: Here we cannot use gA(_, _, 0) to subsitute sA
-  Tensor tCrA = thr_mma.partition_fragment_A(sA);  // (MMA, MMA_M, MMA_K)
-  Tensor tCrB = thr_mma.partition_fragment_B(sB);  // (MMA, MMA_N, MMA_K)
-  Tensor tCrC = thr_mma.partition_fragment_C(sC);  // (MMA, MMA_M, MMA_N)
-  clear(tCrC);  // Set the accumulators to zero
+  Tensor tCrA = thr_mma.partition_fragment_A(sA); // (MMA, MMA_M, MMA_K)
+  Tensor tCrB = thr_mma.partition_fragment_B(sB); // (MMA, MMA_N, MMA_K)
+  Tensor tCrC = thr_mma.partition_fragment_C(sC); // (MMA, MMA_M, MMA_N)
+  clear(tCrC);                                    // Set the accumulators to zero
 
   typename Spec::TiledCopyA_S2R s2r_tiled_copy_a;
   ThrCopy s2r_thr_copy_a = s2r_tiled_copy_a.get_slice(tid);
-  Tensor tAsA_s2r = s2r_thr_copy_a.partition_S(sA);     // (CPY, CPY_M, CPY_K)
-  Tensor tArA_s2r = s2r_thr_copy_a.retile_D(tCrA);      // (CPY, CPY_M, CPY_K)
+  Tensor tAsA_s2r = s2r_thr_copy_a.partition_S(sA); // (CPY, CPY_M, CPY_K)
+  Tensor tArA_s2r = s2r_thr_copy_a.retile_D(tCrA);  // (CPY, CPY_M, CPY_K)
 
   typename Spec::TiledCopyB_S2R s2r_tiled_copy_b;
   ThrCopy s2r_thr_copy_b = s2r_tiled_copy_b.get_slice(tid);
-  Tensor tBsB_s2r = s2r_thr_copy_b.partition_S(sB);     // (CPY, CPY_M, CPY_K)
-  Tensor tBrB_s2r = s2r_thr_copy_b.retile_D(tCrB);      // (CPY, CPY_M, CPY_K)
-
+  Tensor tBsB_s2r = s2r_thr_copy_b.partition_S(sB); // (CPY, CPY_M, CPY_K)
+  Tensor tBrB_s2r = s2r_thr_copy_b.retile_D(tCrB);  // (CPY, CPY_M, CPY_K)
 
   //
   // MAINLOOP
@@ -196,15 +188,15 @@ tma_load_store(__grid_constant__ TMA_A const tma_A,
     // Load C matrix with TMA
     constexpr int tma_transaction_load_c_bytes = kTileM * kTileN * sizeof(ComputeTypeC);
     using SharedStorage_C = SharedStorage_C<ComputeTypeC, SmemLayoutC>;
-    SharedStorage_C& smem_c = *reinterpret_cast<SharedStorage_C*>(smem_raw);
+    SharedStorage_C &smem_c = *reinterpret_cast<SharedStorage_C *>(smem_raw);
     uint64_t &tma_load_c_mbarrier = smem_c.tma_barrier[0];
 
     auto tCrC_load = make_tensor_like<ComputeTypeC>(tCrC);
 
     typename Spec::TiledCopyC_S2R s2r_tiled_copy_c;
     ThrCopy s2r_thr_copy_c = s2r_tiled_copy_c.get_slice(tid);
-    Tensor tCsC_s2r = s2r_thr_copy_c.partition_S(sC);      // (CPY, CPY_M, CPY_K)
-    Tensor tCrC_s2r = s2r_thr_copy_c.retile_D(tCrC_load);  // (CPY, CPY_M, CPY_K)
+    Tensor tCsC_s2r = s2r_thr_copy_c.partition_S(sC);     // (CPY, CPY_M, CPY_K)
+    Tensor tCrC_s2r = s2r_thr_copy_c.retile_D(tCrC_load); // (CPY, CPY_M, CPY_K)
 
     if ((warp_idx == 0) && lane_predicate) {
       initialize_barrier(tma_load_c_mbarrier, /* arrival thread count */ 1);
@@ -219,8 +211,8 @@ tma_load_store(__grid_constant__ TMA_A const tma_A,
 
     copy(s2r_tiled_copy_c, tCsC_s2r, tCrC_s2r);
 
-    // compute with CUDA core
-    #pragma unroll
+// compute with CUDA core
+#pragma unroll
     for (int i = 0; i < size(tCrC); ++i) {
       tCrC(i) = tCrC(i) + tCrC_load(i);
     }
@@ -230,16 +222,15 @@ tma_load_store(__grid_constant__ TMA_A const tma_A,
       invalidate_barrier(tma_load_c_mbarrier);
     }
     __syncthreads();
-
   }
 
   auto tCrD = make_tensor_like<OutType>(tCrC);
-  copy(tCrC, tCrD);  // Convert precision
+  copy(tCrC, tCrD); // Convert precision
 
   typename Spec::TiledCopyD_R2S r2s_tiled_copy_d;
   ThrCopy r2s_thr_copy_d = r2s_tiled_copy_d.get_slice(tid);
-  Tensor tDrD_r2s = r2s_thr_copy_d.retile_S(tCrD);    // (CPY, CPY_M, CPY_N)
-  Tensor tDsD_r2s = r2s_thr_copy_d.partition_D(sD);   // (CPY, CPY_M, CPY_N)
+  Tensor tDrD_r2s = r2s_thr_copy_d.retile_S(tCrD);  // (CPY, CPY_M, CPY_N)
+  Tensor tDsD_r2s = r2s_thr_copy_d.partition_D(sD); // (CPY, CPY_M, CPY_N)
   copy(r2s_tiled_copy_d, tDrD_r2s, tDsD_r2s);
 
   tma_store_fence();
@@ -250,16 +241,19 @@ tma_load_store(__grid_constant__ TMA_A const tma_A,
     tma_store_arrive();
     tma_store_wait<0>();
   }
-
 }
 
 namespace spec {
 
 using namespace cute;
 
-template <typename OutType_, typename ComputeTypeA_,
-          typename ComputeTypeB_, typename ComputeTypeC_,
-          int kTileM_ = 128, int kTileN_ = 128, int kTileK_ = 64>
+template <typename OutType_,
+          typename ComputeTypeA_,
+          typename ComputeTypeB_,
+          typename ComputeTypeC_,
+          int kTileM_ = 128,
+          int kTileN_ = 128,
+          int kTileK_ = 64>
 struct KernelSpec {
   using OutType = OutType_;
   using ComputeTypeA = ComputeTypeA_;
@@ -271,24 +265,17 @@ struct KernelSpec {
   static constexpr int kTileK = kTileK_;
 
   using MMA_op = std::conditional_t<
-    std::is_same_v<ComputeTypeA, cute::bfloat16_t> &&
-    std::is_same_v<ComputeTypeB, cute::bfloat16_t> &&
-    std::is_same_v<ComputeTypeC, float>,
-    SM80_16x8x16_F32BF16BF16F32_TN,
-    std::conditional_t<
-      std::is_same_v<ComputeTypeA, cute::half_t> &&
-      std::is_same_v<ComputeTypeB, cute::half_t> &&
-      std::is_same_v<ComputeTypeC, cute::half_t>,
-      SM80_16x8x16_F16F16F16F16_TN,
+      std::is_same_v<ComputeTypeA, cute::bfloat16_t> && std::is_same_v<ComputeTypeB, cute::bfloat16_t> &&
+          std::is_same_v<ComputeTypeC, float>,
+      SM80_16x8x16_F32BF16BF16F32_TN,
       std::conditional_t<
-        std::is_same_v<ComputeTypeA, cute::half_t> &&
-        std::is_same_v<ComputeTypeB, cute::half_t> &&
-        std::is_same_v<ComputeTypeC, float>,
-        SM80_16x8x16_F32F16F16F32_TN,
-        void
-      >
-    >
-  >;
+          std::is_same_v<ComputeTypeA, cute::half_t> && std::is_same_v<ComputeTypeB, cute::half_t> &&
+              std::is_same_v<ComputeTypeC, cute::half_t>,
+          SM80_16x8x16_F16F16F16F16_TN,
+          std::conditional_t<std::is_same_v<ComputeTypeA, cute::half_t> &&
+                                 std::is_same_v<ComputeTypeB, cute::half_t> && std::is_same_v<ComputeTypeC, float>,
+                             SM80_16x8x16_F32F16F16F32_TN,
+                             void>>>;
 
   static_assert(!std::is_same_v<MMA_op, void>, "Unsupported MMA op!");
 
@@ -308,12 +295,9 @@ struct KernelSpec {
   static constexpr int kMmaTileN = kMmaThrExpandN * kMmaValExpandN * get<1>(MMA_shape{});
   static constexpr int kMmaTileK = kMmaThrExpandK * kMmaValExpandK * get<2>(MMA_shape{});
 
-  using MMAThrLayout = decltype(make_layout(make_shape(Int<kMmaThrExpandM>{},
-                                                       Int<kMmaThrExpandN>{},
-                                                       Int<kMmaThrExpandK>{})));
-  using MMATileLayout = Tile<Int<kMmaTileM>,
-                             Int<kMmaTileN>,
-                             Int<kMmaTileK>>;
+  using MMAThrLayout =
+      decltype(make_layout(make_shape(Int<kMmaThrExpandM>{}, Int<kMmaThrExpandN>{}, Int<kMmaThrExpandK>{})));
+  using MMATileLayout = Tile<Int<kMmaTileM>, Int<kMmaTileN>, Int<kMmaTileK>>;
 
   using TiledMMA = decltype(make_tiled_mma(MMA_op{}, MMAThrLayout{}, MMATileLayout{}));
   static constexpr int kThreadNum = size(TiledMMA{});
@@ -325,7 +309,7 @@ struct KernelSpec {
 
   using CopyA_S2R_atom = Copy_Atom<Copy_S2R_op_A, ComputeTypeA>;
   using CopyB_S2R_atom = Copy_Atom<Copy_S2R_op_B, ComputeTypeB>;
-  using CopyC_S2R_atom = Copy_Atom<Copy_S2R_op_C, ComputeTypeC>;  
+  using CopyC_S2R_atom = Copy_Atom<Copy_S2R_op_C, ComputeTypeC>;
 
   using Copy_R2S_op = SM90_U32x4_STSM_N;
   using CopyD_R2S_atom = Copy_Atom<Copy_R2S_op, OutType>;
@@ -341,9 +325,8 @@ struct KernelSpec {
   // 如果仅使用 uint8_t/char 类型的 SMEM pointer，则是否传入 offset 参数不影响计算结果。
   // Before Layout A: Sw<3,4,3> o _0 o ((_8,_16),(_64,_1)):((_64,_512),(_1,_0))
   // After  Layout A: Sw<3,4,3> o smem_ptr[16b](unset) o ((_8,_16),(_64,_1)):((_64,_512),(_1,_0))
-  using SmemLayoutA = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<ComputeTypeA>{},
-                                             make_shape(Int<kTileM>{}, Int<kTileK>{}),
-                                             Step<_1,_2>{}));
+  using SmemLayoutA = decltype(tile_to_shape(
+      GMMA::Layout_K_SW128_Atom<ComputeTypeA>{}, make_shape(Int<kTileM>{}, Int<kTileK>{}), Step<_1, _2>{}));
   // Also we can use:
   // using SmemLayoutAtomA = decltype(composition(
   //                                     Swizzle<3, 4, 3>{},
@@ -353,80 +336,78 @@ struct KernelSpec {
   // using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtomA{},
   //                                            make_shape(Int<kTileM>{}, Int<kTileK>{}),
   //                                            Step<_1,_2>{}));
-  using SmemLayoutB = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<ComputeTypeB>{},
-                                             make_shape(Int<kTileN>{}, Int<kTileK>{}),
-                                             Step<_1,_2>{}));
-  using SmemLayoutC = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<ComputeTypeC>{},
-                                             make_shape(Int<kTileM>{}, Int<kTileN>{}),
-                                             Step<_1,_2>{}));
-  using SmemLayoutD = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<OutType>{},
-                                             make_shape(Int<kTileM>{}, Int<kTileN>{}),
-                                             Step<_1,_2>{}));
+  using SmemLayoutB = decltype(tile_to_shape(
+      GMMA::Layout_K_SW128_Atom<ComputeTypeB>{}, make_shape(Int<kTileN>{}, Int<kTileK>{}), Step<_1, _2>{}));
+  using SmemLayoutC = decltype(tile_to_shape(
+      GMMA::Layout_K_SW128_Atom<ComputeTypeC>{}, make_shape(Int<kTileM>{}, Int<kTileN>{}), Step<_1, _2>{}));
+  using SmemLayoutD = decltype(tile_to_shape(
+      GMMA::Layout_K_SW128_Atom<OutType>{}, make_shape(Int<kTileM>{}, Int<kTileN>{}), Step<_1, _2>{}));
 
   static constexpr int kShmSizeA = cosize_v<SmemLayoutA> * sizeof(ComputeTypeA);
   static constexpr int kShmSizeB = cosize_v<SmemLayoutB> * sizeof(ComputeTypeB);
   static constexpr int kShmSizeC = cosize_v<SmemLayoutC> * sizeof(ComputeTypeC);
   static constexpr int kShmSizeD = cosize_v<SmemLayoutD> * sizeof(OutType);
 
-  static constexpr int kShmSize = cute::max(sizeof(SharedStorage_AB<ComputeTypeA, ComputeTypeB, SmemLayoutA, SmemLayoutB>),
-                                  cute::max(sizeof(SharedStorage_C<ComputeTypeC, SmemLayoutC>),
-                                            kShmSizeD));
+  static constexpr int kShmSize =
+      cute::max(sizeof(SharedStorage_AB<ComputeTypeA, ComputeTypeB, SmemLayoutA, SmemLayoutB>),
+                cute::max(sizeof(SharedStorage_C<ComputeTypeC, SmemLayoutC>), kShmSizeD));
 };
 
-}  // namespace spec
+} // namespace spec
 
-
-#define CHECK_TORCH_TENSOR_DTYPE(T, DTYPE)                       \
-  do {                                                           \
-    if ((T).options().dtype() != (DTYPE)) {                      \
-      std::cerr << "Tensor dtype mismatch! Expected: "           \
-                << (DTYPE) << ", but got: "                      \
-                << (T).options().dtype()                         \
-                << " at " << __FILE__                            \
-                << ":" << __LINE__ << std::endl;                 \
-      std::exit(EXIT_FAILURE);                                   \
-    }                                                            \
+#define CHECK_TORCH_TENSOR_DTYPE(T, DTYPE)                                                                            \
+  do {                                                                                                                \
+    if ((T).options().dtype() != (DTYPE)) {                                                                           \
+      std::cerr << "Tensor dtype mismatch! Expected: " << (DTYPE) << ", but got: " << (T).options().dtype() << " at " \
+                << __FILE__ << ":" << __LINE__ << std::endl;                                                          \
+      std::exit(EXIT_FAILURE);                                                                                        \
+    }                                                                                                                 \
   } while (0);
 
-#define CHECK_TORCH_TENSOR_SHAPE(T, M, N)                        \
-  do {                                                           \
-    auto actual_shape = (T).sizes();                             \
-    if (actual_shape != torch::IntArrayRef({M, N})) {            \
-      std::cerr << "Tensor shape mismatch! Expected: "           \
-                << torch::IntArrayRef({M, N})                    \
-                << ", but got: " << actual_shape                 \
-                << " at " << __FILE__                            \
-                << ":" << __LINE__ << std::endl;                 \
-      std::exit(EXIT_FAILURE);                                   \
-    }                                                            \
+#define CHECK_TORCH_TENSOR_SHAPE(T, M, N)                                                                             \
+  do {                                                                                                                \
+    auto actual_shape = (T).sizes();                                                                                  \
+    if (actual_shape != torch::IntArrayRef({M, N})) {                                                                 \
+      std::cerr << "Tensor shape mismatch! Expected: " << torch::IntArrayRef({M, N}) << ", but got: " << actual_shape \
+                << " at " << __FILE__ << ":" << __LINE__ << std::endl;                                                \
+      std::exit(EXIT_FAILURE);                                                                                        \
+    }                                                                                                                 \
   } while (0);
 
-#define BOOL_SWITCH(COND, CONST_NAME, ...)      \
-  [&] {                                         \
-    if (COND) {                                 \
-      constexpr static bool CONST_NAME = true;  \
-      return __VA_ARGS__();                     \
-    } else {                                    \
-      constexpr static bool CONST_NAME = false; \
-      return __VA_ARGS__();                     \
-    }                                           \
+#define BOOL_SWITCH(COND, CONST_NAME, ...)                                                                            \
+  [&] {                                                                                                               \
+    if (COND) {                                                                                                       \
+      constexpr static bool CONST_NAME = true;                                                                        \
+      return __VA_ARGS__();                                                                                           \
+    } else {                                                                                                          \
+      constexpr static bool CONST_NAME = false;                                                                       \
+      return __VA_ARGS__();                                                                                           \
+    }                                                                                                                 \
   }()
 
-template <typename T>
-constexpr torch::ScalarType to_torch_scalar_type() {
-    if constexpr (std::is_same_v<T, cute::half_t>) return torch::kHalf;
-    else if constexpr (std::is_same_v<T, cute::bfloat16_t>) return torch::kBFloat16;
-    else if constexpr (std::is_same_v<T, float>) return torch::kFloat32;
-    else if constexpr (std::is_same_v<T, cute::float_e4m3_t>) return torch::kFloat8_e4m3fn;
-    else if constexpr (std::is_same_v<T, cute::float_e5m2_t>) return torch::kFloat8_e5m2;
-    else throw std::runtime_error("Unsupported type!");
+template <typename T> constexpr torch::ScalarType to_torch_scalar_type() {
+  if constexpr (std::is_same_v<T, cute::half_t>)
+    return torch::kHalf;
+  else if constexpr (std::is_same_v<T, cute::bfloat16_t>)
+    return torch::kBFloat16;
+  else if constexpr (std::is_same_v<T, float>)
+    return torch::kFloat32;
+  else if constexpr (std::is_same_v<T, cute::float_e4m3_t>)
+    return torch::kFloat8_e4m3fn;
+  else if constexpr (std::is_same_v<T, cute::float_e5m2_t>)
+    return torch::kFloat8_e5m2;
+  else
+    throw std::runtime_error("Unsupported type!");
 }
 
-
-template<int kTileM, int kTileN, int kTileK, typename OutType,
-         typename ComputeTypeA, typename ComputeTypeB, typename ComputeTypeC = OutType>
-torch::Tensor
-run_tma_load_store(const torch::Tensor a, const torch::Tensor b, std::optional<torch::Tensor> _c) {
+template <int kTileM,
+          int kTileN,
+          int kTileK,
+          typename OutType,
+          typename ComputeTypeA,
+          typename ComputeTypeB,
+          typename ComputeTypeC = OutType>
+torch::Tensor run_tma_load_store(const torch::Tensor a, const torch::Tensor b, std::optional<torch::Tensor> _c) {
 
   at::cuda::CUDAGuard device_guard{a.get_device()};
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -470,8 +451,8 @@ run_tma_load_store(const torch::Tensor a, const torch::Tensor b, std::optional<t
   dim3 grid(cute::ceil_div(N, Spec::kTileN), cute::ceil_div(M, Spec::kTileM));
   int shm_size = Spec::kShmSize;
 
-  printf("Block Size: (%d, %d, %d) | Grid Size: (%d, %d, %d) | Shared Memory Size: %d Bytes\n",
-          block.x, block.y, block.z, grid.x, grid.y, grid.z, shm_size);
+  printf("Block Size: (%d, %d, %d) | Grid Size: (%d, %d, %d) | Shared Memory Size: %d Bytes\n", block.x, block.y,
+         block.z, grid.x, grid.y, grid.z, shm_size);
 
   ////////////////////////////////////////////////////////////////////////////////////
   ////////////////////////////////// TMA Specific Code ///////////////////////////////
@@ -479,15 +460,11 @@ run_tma_load_store(const torch::Tensor a, const torch::Tensor b, std::optional<t
 
   using namespace cute;
 
-  auto mA = make_tensor(make_gmem_ptr((ComputeTypeA *)a.data_ptr()),
-                        make_layout(make_shape(M, K), LayoutRight{}));
+  auto mA = make_tensor(make_gmem_ptr((ComputeTypeA *)a.data_ptr()), make_layout(make_shape(M, K), LayoutRight{}));
   // auto mA = make_tensor(make_gmem_ptr((ComputeTypeA *)a.data_ptr()), make_shape(M, K), GenRowMajor{});
-  auto mB = make_tensor(make_gmem_ptr((ComputeTypeB *)b.data_ptr()),
-                        make_layout(make_shape(N, K), LayoutRight{}));
-  auto mC = make_tensor(make_gmem_ptr((ComputeTypeC *)c.data_ptr()),
-                        make_layout(make_shape(M, N), LayoutRight{}));
-  auto mD = make_tensor(make_gmem_ptr((OutType *)d.data_ptr()),
-                        make_layout(make_shape(M, N), LayoutRight{}));
+  auto mB = make_tensor(make_gmem_ptr((ComputeTypeB *)b.data_ptr()), make_layout(make_shape(N, K), LayoutRight{}));
+  auto mC = make_tensor(make_gmem_ptr((ComputeTypeC *)c.data_ptr()), make_layout(make_shape(M, N), LayoutRight{}));
+  auto mD = make_tensor(make_gmem_ptr((OutType *)d.data_ptr()), make_layout(make_shape(M, N), LayoutRight{}));
 
   auto smem_layout_A = typename Spec::SmemLayoutA{};
   auto smem_layout_B = typename Spec::SmemLayoutB{};
@@ -513,11 +490,10 @@ run_tma_load_store(const torch::Tensor a, const torch::Tensor b, std::optional<t
   // Kernel launch
   BOOL_SWITCH(is_gemm, IsGemm, [&] {
     cudaEventRecord(start, stream);
-    cudaFuncSetAttribute(tma_load_store<Spec, IsGemm, decltype(tma_A), decltype(tma_B), decltype(tma_C), decltype(tma_D)>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
-    tma_load_store<Spec, IsGemm><<<grid, block, shm_size, stream>>>(
-      tma_A, tma_B, tma_C, tma_D, M, N, K
-    );
+    cudaFuncSetAttribute(
+        tma_load_store<Spec, IsGemm, decltype(tma_A), decltype(tma_B), decltype(tma_C), decltype(tma_D)>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    tma_load_store<Spec, IsGemm><<<grid, block, shm_size, stream>>>(tma_A, tma_B, tma_C, tma_D, M, N, K);
     cudaEventRecord(stop, stream);
   });
 
@@ -525,9 +501,8 @@ run_tma_load_store(const torch::Tensor a, const torch::Tensor b, std::optional<t
 
   auto error = cudaGetLastError();
   if (error != cudaSuccess) {
-    throw std::runtime_error(
-      std::string("CUDA error: ") + cudaGetErrorString(error) +
-      " (error code: " + std::to_string(error) + ")");
+    throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(error) +
+                             " (error code: " + std::to_string(error) + ")");
   }
 
   float milliseconds = 0;
@@ -541,7 +516,13 @@ run_tma_load_store(const torch::Tensor a, const torch::Tensor b, std::optional<t
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("tma_load_store_fp16_fp16_fp16_fp16", &(run_tma_load_store<128, 128, 64, cute::half_t, cute::half_t, cute::half_t>), "Run a mixed-precision half 16x8x8 MMA operation.");
-  m.def("tma_load_store_fp16_fp16_fp16_fp32", &(run_tma_load_store<128, 128, 64, cute::half_t, cute::half_t, cute::half_t, float>), "Run a mixed-precision half 16x8x8 MMA operation.");
-  m.def("tma_load_store_bf16_bf16_bf16_fp32", &(run_tma_load_store<128, 128, 64, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t, float>), "Run a mixed-precision half 16x8x8 MMA operation.");
+  m.def("tma_load_store_fp16_fp16_fp16_fp16",
+        &(run_tma_load_store<128, 128, 64, cute::half_t, cute::half_t, cute::half_t>),
+        "Run a mixed-precision half 16x8x8 MMA operation.");
+  m.def("tma_load_store_fp16_fp16_fp16_fp32",
+        &(run_tma_load_store<128, 128, 64, cute::half_t, cute::half_t, cute::half_t, float>),
+        "Run a mixed-precision half 16x8x8 MMA operation.");
+  m.def("tma_load_store_bf16_bf16_bf16_fp32",
+        &(run_tma_load_store<128, 128, 64, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t, float>),
+        "Run a mixed-precision half 16x8x8 MMA operation.");
 }
