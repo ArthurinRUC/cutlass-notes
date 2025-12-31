@@ -1,0 +1,105 @@
+name: Code Quality Checks
+
+on:
+  pull_request:
+    branches-ignore: []
+
+jobs:
+  python-quality-check:
+    name: Python Code Quality Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Python dependencies
+      run: pip install ruff==0.14.6
+
+    - name: Run Python quality check
+      id: python-check
+      run: make quality
+
+    - name: Auto-fix Python formatting
+      if: steps.python-check.outcome == 'failure' && github.event_name == 'pull_request'
+      run: |
+        echo "Attempting to auto-fix Python formatting issues..."
+        make style
+
+        if git diff --quiet; then
+          echo "No changes to commit after auto-fix"
+          exit 0
+        fi
+
+        echo "Changes detected, committing fixes..."
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        git add -A
+        git commit -m "style: auto-format Python code with ruff [skip ci]"
+
+        echo "Pushing changes..."
+        git push
+
+    - name: Fail if Python check failed and not auto-fixed
+      if: steps.python-check.outcome == 'failure' && steps.auto-fix-python.outcome == 'failure'
+      run: |
+        echo "Python quality check failed and auto-fix did not succeed"
+        exit 1
+
+  cpp-quality-check:
+    name: C++ Code Quality Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install clang-format via pip
+      run: pip install clang-format==21.1.8
+
+    - name: Run C++ quality check
+      id: cpp-check
+      run: make cquality
+
+    - name: Auto-fix C++ formatting
+      id: auto-fix-cpp
+      if: steps.cpp-check.outcome == 'failure' && github.event_name == 'pull_request'
+      run: |
+        echo "Attempting to auto-fix C++ formatting issues..."
+        make cstyle
+        
+        if git diff --quiet; then
+          echo "No changes to commit after auto-fix"
+          exit 0
+        fi
+        
+        echo "Changes detected, committing fixes..."
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        git add -A
+        git commit -m "style: auto-format C++ code with clang-format [skip ci]"
+        
+        echo "Pushing changes..."
+        git push
+
+    - name: Fail if C++ check failed and not auto-fixed
+      if: steps.cpp-check.outcome == 'failure' && steps.auto-fix-cpp.outcome == 'failure'
+      run: |
+        echo "C++ quality check failed and auto-fix did not succeed"
+        exit 1
