@@ -17,6 +17,7 @@ jobs:
       with:
         fetch-depth: 0
         token: ${{ secrets.GITHUB_TOKEN }}
+        ref: ${{ github.event.pull_request.head.ref || github.ref }}
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -28,9 +29,11 @@ jobs:
 
     - name: Run Python quality check
       id: python-check
+      continue-on-error: true
       run: make quality
 
     - name: Auto-fix Python formatting
+      id: auto-fix-python
       if: steps.python-check.outcome == 'failure' && github.event_name == 'pull_request'
       run: |
         echo "Attempting to auto-fix Python formatting issues..."
@@ -48,12 +51,13 @@ jobs:
         git commit -m "style: auto-format Python code with ruff [skip ci]"
 
         echo "Pushing changes..."
-        git push
+        git push origin HEAD:${{ github.event.pull_request.head.ref || github.ref_name }}
 
     - name: Fail if Python check failed and not auto-fixed
-      if: steps.python-check.outcome == 'failure' && steps.auto-fix-python.outcome == 'failure'
+      if: steps.python-check.outcome == 'failure' && (steps.auto-fix-python.outcome == 'failure' || github.event_name != 'pull_request')
       run: |
-        echo "Python quality check failed and auto-fix did not succeed"
+        echo "Python quality check failed"
+        echo "For PRs, auto-fix was attempted. Check the auto-fix step for details."
         exit 1
 
   cpp-quality-check:
@@ -66,6 +70,7 @@ jobs:
       with:
         fetch-depth: 0
         token: ${{ secrets.GITHUB_TOKEN }}
+        ref: ${{ github.event.pull_request.head.ref || github.ref }}
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -77,6 +82,7 @@ jobs:
 
     - name: Run C++ quality check
       id: cpp-check
+      continue-on-error: true
       run: make cquality
 
     - name: Auto-fix C++ formatting
@@ -98,10 +104,11 @@ jobs:
         git commit -m "style: auto-format C++ code with clang-format [skip ci]"
         
         echo "Pushing changes..."
-        git push
+        git push origin HEAD:${{ github.event.pull_request.head.ref || github.ref_name }}
 
     - name: Fail if C++ check failed and not auto-fixed
-      if: steps.cpp-check.outcome == 'failure' && steps.auto-fix-cpp.outcome == 'failure'
+      if: steps.cpp-check.outcome == 'failure' && (steps.auto-fix-cpp.outcome == 'failure' || github.event_name != 'pull_request')
       run: |
-        echo "C++ quality check failed and auto-fix did not succeed"
+        echo "C++ quality check failed"
+        echo "For PRs, auto-fix was attempted. Check the auto-fix step for details."
         exit 1
