@@ -1,17 +1,15 @@
-import torch
 import os
 import subprocess
+
+import torch
 from torch.utils.cpp_extension import load
+
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 cutlass_include_path = os.path.join(current_dir, "../third-party/cutlass/include")
-sources = [
-    os.path.join(current_dir, filename) for filename in ["mixed_precision_gemm.cu"]
-]
+sources = [os.path.join(current_dir, filename) for filename in ["mixed_precision_gemm.cu"]]
 
-os.environ["TORCH_CUDA_ARCH_LIST"] = ".".join(
-    map(str, torch.cuda.get_device_capability())
-)
+os.environ["TORCH_CUDA_ARCH_LIST"] = ".".join(map(str, torch.cuda.get_device_capability()))
 
 # Load CUDA extension module
 lib = load(
@@ -79,9 +77,7 @@ def compare_matrix(kernel_output: torch.Tensor, torch_output: torch.Tensor):
     if not is_correct:
         num_failed += 1
 
-        print(
-            f" Kernel Output: {tuple(kernel_output.shape)} ".center(PRINT_LENGTH, "-")
-        )
+        print(f" Kernel Output: {tuple(kernel_output.shape)} ".center(PRINT_LENGTH, "-"))
         print(kernel_output[:8, :8])
 
         print(f" Torch Output: {tuple(torch_output.shape)} ".center(PRINT_LENGTH, "-"))
@@ -94,7 +90,6 @@ def compare_matrix(kernel_output: torch.Tensor, torch_output: torch.Tensor):
             PRINT_LENGTH, "-"
         )
     )
-
 
 
 # ---------------- fp32 = bf16 * bf16 + fp32 ----------------
@@ -243,6 +238,4 @@ if sm_version >= (8, 9) and cuda_version >= (12, 4):
             compare_matrix(kernel_output, torch_output)
 
 
-print(
-    f" Summary: {num_succeed} Succeed, {num_failed} Failed ".center(PRINT_LENGTH, "-")
-)
+print(f" Summary: {num_succeed} Succeed, {num_failed} Failed ".center(PRINT_LENGTH, "-"))
