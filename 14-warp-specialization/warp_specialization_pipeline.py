@@ -63,7 +63,7 @@ num_succeed = 0
 num_failed = 0
 
 
-def compare_matrix(kernel_output: torch.Tensor, torch_output: torch.Tensor):
+def compare_matrix(kernel_output: torch.Tensor,  torch_output: torch.Tensor):
     kernel_output = kernel_output.float()
     torch_output = torch_output.float()
 
