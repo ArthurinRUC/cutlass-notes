@@ -32,9 +32,9 @@ template <typename OutType_,
           typename ComputeTypeB_,
           typename ComputeTypeC_,
           typename AccType_,
-          int kTileM_,
-          int kTileN_,
-          int kTileK_,
+          int kBlockM_,
+          int kBlockN_,
+          int kBlockK_,
           int G2S_Stages_ = 3>
 struct KernelSpec {
   using OutType = OutType_;
@@ -42,9 +42,9 @@ struct KernelSpec {
   using ComputeTypeB = ComputeTypeB_;
   using ComputeTypeC = ComputeTypeC_;
 
-  static constexpr int kTileM = kTileM_;
-  static constexpr int kTileN = kTileN_;
-  static constexpr int kTileK = kTileK_;
+  static constexpr int kBlockM = kBlockM_;
+  static constexpr int kBlockN = kBlockN_;
+  static constexpr int kBlockK = kBlockK_;
 
   static constexpr int G2S_Stages = G2S_Stages_;
   static_assert(G2S_Stages >= 2, "G2S_Stages should not be less than 2.");
@@ -87,14 +87,7 @@ struct KernelSpec {
   using TiledMMA = decltype(make_tiled_mma(MMA_op{}, MMAThrLayout{}, MMATileLayout{}));
 
   static constexpr int kThreadNum = size(TiledMMA{});
-  static constexpr int kThreadsPerWarp = 32;
-  static constexpr int kTileM_Copy = cute::min(kThreadsPerWarp, kTileM);
-  static constexpr int kTileN_Copy = cute::min(kThreadsPerWarp, kTileN);
-
-  static constexpr int kAlignedCopyItemsA =
-      cute::min(128 / 8 / sizeof(ComputeTypeA), kTileK *kTileM_Copy / kThreadNum);
-  static constexpr int kAlignedCopyItemsB =
-      cute::min(128 / 8 / sizeof(ComputeTypeB), kTileK *kTileN_Copy / kThreadNum);
+  static constexpr int kBlockK_Copy = cute::min(64, kBlockK) / 8;
 
   using Copy_G2S_op = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
   using CopyA_G2S_atom = Copy_Atom<Copy_G2S_op, ComputeTypeA>;
@@ -102,14 +95,14 @@ struct KernelSpec {
 
   using TiledCopyA_G2S =
       decltype(make_tiled_copy(CopyA_G2S_atom{},
-                               make_layout(make_shape(Int<kTileM_Copy>{}, Int<kThreadNum / kTileM_Copy>{}),
-                                           make_stride(Int<kThreadNum / kTileM_Copy>{}, Int<1>{})),
-                               make_layout(make_shape(Int<1>{}, Int<kAlignedCopyItemsA>{}))));
+                               make_layout(make_shape(Int<kThreadNum / kBlockK_Copy>{}, Int<kBlockK_Copy>{}),
+                                           make_stride(Int<kBlockK_Copy>{}, Int<1>{})),
+                               make_layout(make_shape(Int<1>{}, Int<8>{}))));
   using TiledCopyB_G2S =
       decltype(make_tiled_copy(CopyB_G2S_atom{},
-                               make_layout(make_shape(Int<kTileN_Copy>{}, Int<kThreadNum / kTileN_Copy>{}),
-                                           make_stride(Int<kThreadNum / kTileN_Copy>{}, Int<1>{})),
-                               make_layout(make_shape(Int<1>{}, Int<kAlignedCopyItemsB>{}))));
+                               make_layout(make_shape(Int<kThreadNum / kBlockK_Copy>{}, Int<kBlockK_Copy>{}),
+                                           make_stride(Int<kBlockK_Copy>{}, Int<1>{})),
+                               make_layout(make_shape(Int<1>{}, Int<8>{}))));
 
   using Copy_S2R_op_A = std::conditional_t<sizeof(ComputeTypeA) == 2, SM75_U32x4_LDSM_N, AutoVectorizingCopy>;
   using Copy_S2R_op_B = std::conditional_t<sizeof(ComputeTypeB) == 2, SM75_U32x4_LDSM_N, AutoVectorizingCopy>;
@@ -118,8 +111,8 @@ struct KernelSpec {
   using CopyB_S2R_atom = Copy_Atom<Copy_S2R_op_B, ComputeTypeB>;
 
   using SmemLayoutAtomA = decltype(composition(Swizzle<3, 3, 3>{},
-                                               make_layout(make_shape(Int<8>{}, Int<cute::min(64, kTileK)>{}),
-                                                           make_stride(Int<cute::min(64, kTileK)>{}, Int<1>{}))));
+                                               make_layout(make_shape(Int<8>{}, Int<cute::min(64, kBlockK)>{}),
+                                                           make_stride(Int<cute::min(64, kBlockK)>{}, Int<1>{}))));
   using SmemLayoutAtomB = SmemLayoutAtomA;
 
   //////////////////////////////////////////////////////////////////////////////////
@@ -150,7 +143,7 @@ struct KernelSpec {
   using ElementCompute = AccType_;
   using ArchTag = cutlass::arch::Sm80;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
-  using TileShape = Shape<Int<kTileM_>, Int<kTileN_>, Int<kTileK_>>;
+  using TileShape = Shape<Int<kBlockM_>, Int<kBlockN_>, Int<kBlockK_>>;
 
   using DispatchPolicy = cutlass::gemm::MainloopSm80CpAsync<G2S_Stages>;
 
@@ -289,9 +282,9 @@ template <typename ComputeTypeC, typename OutType> constexpr bool needs_precisio
   return !std::is_same_v<ComputeTypeC, OutType>;
 }
 
-template <int kTileM,
-          int kTileN,
-          int kTileK,
+template <int kBlockM,
+          int kBlockN,
+          int kBlockK,
           int G2S_Stages,
           typename OutType,
           typename ComputeTypeA,
@@ -343,7 +336,7 @@ torch::Tensor run_gemm_api(const torch::Tensor a, const torch::Tensor b, std::op
   }
 
   using Spec =
-      spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, AccType, kTileM, kTileN, kTileK, G2S_Stages>;
+      spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, AccType, kBlockM, kBlockN, kBlockK, G2S_Stages>;
 
   void *out_ptr = IsCvtPrecision ? out.data_ptr() : c.data_ptr();
 

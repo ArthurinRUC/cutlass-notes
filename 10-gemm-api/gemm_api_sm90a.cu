@@ -31,9 +31,9 @@ template <typename OutType_,
           typename ComputeTypeB_,
           typename ComputeTypeC_,
           typename AccType_,
-          int kTileM_,
-          int kTileN_,
-          int kTileK_>
+          int kBlockM_,
+          int kBlockN_,
+          int kBlockK_>
 struct KernelSpec {
   // A matrix configuration
   using ElementA = ComputeTypeA_;
@@ -60,7 +60,7 @@ struct KernelSpec {
   using ElementCompute = AccType_;
   using ArchTag = cutlass::arch::Sm90;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
-  using TileShape = Shape<Int<kTileM_>, Int<kTileN_>, Int<kTileK_>>;
+  using TileShape = Shape<Int<kBlockM_>, Int<kBlockN_>, Int<kBlockK_>>;
   using ClusterShape = Shape<_2, _1, _1>;
   using StageCount = cutlass::gemm::collective::StageCountAuto;
   using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
@@ -219,9 +219,9 @@ template <typename ComputeTypeC, typename OutType> constexpr bool needs_precisio
   return !std::is_same_v<ComputeTypeC, OutType>;
 }
 
-template <int kTileM,
-          int kTileN,
-          int kTileK,
+template <int kBlockM,
+          int kBlockN,
+          int kBlockK,
           typename OutType,
           typename ComputeTypeA,
           typename ComputeTypeB,
@@ -268,7 +268,7 @@ torch::Tensor run_gemm_api(const torch::Tensor a, const torch::Tensor b, std::op
     CHECK_TORCH_TENSOR_SHAPE(out, M, N)
   }
 
-  using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, AccType, kTileM, kTileN, kTileK>;
+  using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, AccType, kBlockM, kBlockN, kBlockK>;
 
   void *out_ptr = IsCvtPrecision ? out.data_ptr() : c.data_ptr();
 
