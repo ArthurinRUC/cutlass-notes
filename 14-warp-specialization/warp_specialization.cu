@@ -98,9 +98,9 @@ __global__ __launch_bounds__(Spec::kThreadNum) void warp_specialization(__grid_c
   using SmemLayoutC = typename Spec::SmemLayoutC;
   using SmemLayoutD = typename Spec::SmemLayoutD;
 
-  constexpr int kTileM = Spec::kTileM;
-  constexpr int kTileN = Spec::kTileN;
-  constexpr int kTileK = Spec::kTileK;
+  constexpr int kBlockM = Spec::kBlockM;
+  constexpr int kBlockN = Spec::kBlockN;
+  constexpr int kBlockK = Spec::kBlockK;
   constexpr int kStages = Spec::kStages;
   constexpr int kClusterSize = Spec::kClusterSize;
   constexpr int kProducerRegisters = Spec::kProducerRegisters;
@@ -110,7 +110,7 @@ __global__ __launch_bounds__(Spec::kThreadNum) void warp_specialization(__grid_c
   int tid = threadIdx.x;
   int bidx = blockIdx.x;
   int bidy = blockIdx.y;
-  int NTilesK = ceil_div(K, kTileK);
+  int NTilesK = ceil_div(K, kBlockK);
 
   int warpgroup_idx = cutlass::canonical_warp_group_idx();
   int thread_idx_in_warpgroup = tid % cutlass::NumThreadsPerWarpGroup;
@@ -154,7 +154,7 @@ __global__ __launch_bounds__(Spec::kThreadNum) void warp_specialization(__grid_c
   Tensor mC = tma_C.get_tma_tensor(make_shape(M, N));
   Tensor mD = tma_D.get_tma_tensor(make_shape(M, N));
 
-  auto tiler = make_tile(Int<kTileM>{}, Int<kTileN>{}, Int<kTileK>{});
+  auto tiler = make_tile(Int<kBlockM>{}, Int<kBlockN>{}, Int<kBlockK>{});
   auto coord = make_coord(bidy, bidx, _);
 
   Tensor gA = local_tile(mA, tiler, coord, Step<_1, X, _1>{}); // (BLK_M, BLK_K, K_TILES)
@@ -222,7 +222,7 @@ __global__ __launch_bounds__(Spec::kThreadNum) void warp_specialization(__grid_c
                       group_modes<0, 2>(sB), group_modes<0, 2>(gB)); // (TMA,K_TILES) and (TMA,kStages)
 
     constexpr int tma_transaction_bytes =
-        kTileM * kTileK * sizeof(ComputeTypeA) + kTileN * kTileK * sizeof(ComputeTypeB);
+        kBlockM * kBlockK * sizeof(ComputeTypeA) + kBlockN * kBlockK * sizeof(ComputeTypeB);
 
     int smem_write_pipe = 0;
     int mma_phase_bit = 1;
@@ -340,7 +340,7 @@ __global__ __launch_bounds__(Spec::kThreadNum) void warp_specialization(__grid_c
 
       if constexpr (!IsGemm) {
         // Load C matrix with TMA
-        constexpr int tma_transaction_load_c_bytes = kTileM * kTileN * sizeof(ComputeTypeC);
+        constexpr int tma_transaction_load_c_bytes = kBlockM * kBlockN * sizeof(ComputeTypeC);
         using SharedStorage_C = SharedStorage_C<ComputeTypeC, SmemLayoutC>;
         SharedStorage_C &smem_c = *reinterpret_cast<SharedStorage_C *>(smem_raw);
         uint64_t &tma_load_c_mbarrier = smem_c.tma_barrier[0];
@@ -412,9 +412,9 @@ template <typename OutType_,
           typename ComputeTypeA_,
           typename ComputeTypeB_,
           typename ComputeTypeC_,
-          int kTileM_ = 128,
-          int kTileN_ = 128,
-          int kTileK_ = 64,
+          int kBlockM_ = 128,
+          int kBlockN_ = 128,
+          int kBlockK_ = 64,
           int kStages_ = 3>
 struct KernelSpec {
   using OutType = OutType_;
@@ -422,9 +422,9 @@ struct KernelSpec {
   using ComputeTypeB = ComputeTypeB_;
   using ComputeTypeC = ComputeTypeC_;
 
-  static constexpr int kTileM = kTileM_;
-  static constexpr int kTileN = kTileN_;
-  static constexpr int kTileK = kTileK_;
+  static constexpr int kBlockM = kBlockM_;
+  static constexpr int kBlockN = kBlockN_;
+  static constexpr int kBlockK = kBlockK_;
   static constexpr int kStages = kStages_;
 
   static constexpr cute::GMMA::Major GmmaMajorA = cute::GMMA::Major::K;
@@ -433,7 +433,7 @@ struct KernelSpec {
   using MMA_op = decltype(cute::GMMA::ss_op_selector<ComputeTypeA,
                                                      ComputeTypeB,
                                                      ComputeTypeC,
-                                                     Shape<Int<kTileM>, Int<kTileN>, Int<kTileK>>,
+                                                     Shape<Int<kBlockM>, Int<kBlockN>, Int<kBlockK>>,
                                                      GmmaMajorA,
                                                      GmmaMajorB>());
 
@@ -484,13 +484,13 @@ struct KernelSpec {
   using TiledCopyD_R2S = decltype(make_tiled_copy_C(CopyD_R2S_atom{}, TiledMMA{}));
 
   using SmemLayoutA = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<ComputeTypeA>{},
-                                             make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStages>{})));
+                                             make_shape(Int<kBlockM>{}, Int<kBlockK>{}, Int<kStages>{})));
   using SmemLayoutB = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<ComputeTypeB>{},
-                                             make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<kStages>{})));
+                                             make_shape(Int<kBlockN>{}, Int<kBlockK>{}, Int<kStages>{})));
   using SmemLayoutC =
-      decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<ComputeTypeC>{}, make_shape(Int<kTileM>{}, Int<kTileN>{})));
+      decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<ComputeTypeC>{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
   using SmemLayoutD =
-      decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<OutType>{}, make_shape(Int<kTileM>{}, Int<kTileN>{})));
+      decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<OutType>{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
 
   static constexpr int kShmSizeA = cosize_v<SmemLayoutA> * sizeof(ComputeTypeA);
   static constexpr int kShmSizeB = cosize_v<SmemLayoutB> * sizeof(ComputeTypeB);
@@ -556,9 +556,9 @@ template <typename ComputeTypeC, typename OutType> constexpr bool if_use_tma_sto
     return false;
 }
 
-template <int kTileM,
-          int kTileN,
-          int kTileK,
+template <int kBlockM,
+          int kBlockN,
+          int kBlockK,
           int kStages,
           typename OutType,
           typename ComputeTypeA,
@@ -602,7 +602,7 @@ torch::Tensor run_warp_specialization(const torch::Tensor a, const torch::Tensor
   if (!is_gemm) CHECK_TORCH_TENSOR_SHAPE(c, M, N)
   CHECK_TORCH_TENSOR_SHAPE(d, M, N)
 
-  using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, kTileM, kTileN, kTileK, kStages>;
+  using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, kBlockM, kBlockN, kBlockK, kStages>;
 
   auto cluster_shape = typename Spec::ClusterShape{};
 
@@ -610,8 +610,8 @@ torch::Tensor run_warp_specialization(const torch::Tensor a, const torch::Tensor
 
   dim3 block = Spec::kThreadNum;
   dim3 cluster(cls_x, cls_y, cls_z);
-  dim3 grid(cute::max(cute::ceil_div(N, Spec::kTileN), Spec::kClusterDimX),
-            cute::max(cute::ceil_div(M, Spec::kTileM), Spec::kClusterDimY));
+  dim3 grid(cute::max(cute::ceil_div(N, Spec::kBlockN), Spec::kClusterDimX),
+            cute::max(cute::ceil_div(M, Spec::kBlockM), Spec::kClusterDimY));
   int shm_size = Spec::kShmSize;
 
   printf("Block Size: (%d, %d, %d) | Cluster Size: (%d, %d, %d) | Grid Size: (%d, %d, %d) | Shared Memory Size: %d "

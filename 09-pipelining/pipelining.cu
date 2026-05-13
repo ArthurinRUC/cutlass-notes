@@ -25,9 +25,9 @@ __global__ __launch_bounds__(Spec::kThreadNum) void pipelining(void *__restrict_
   using SmemLayoutC = typename Spec::SmemLayoutC;
   using SmemLayoutO = typename Spec::SmemLayoutO;
 
-  constexpr int kTileM = Spec::kTileM;
-  constexpr int kTileN = Spec::kTileN;
-  constexpr int kTileK = Spec::kTileK;
+  constexpr int kBlockM = Spec::kBlockM;
+  constexpr int kBlockN = Spec::kBlockN;
+  constexpr int kBlockK = Spec::kBlockK;
   constexpr int kShmSizeA = Spec::kShmSizeA;
   constexpr int kShmSizeB = Spec::kShmSizeB;
   constexpr int G2S_Stages = Spec::G2S_Stages;
@@ -53,7 +53,7 @@ __global__ __launch_bounds__(Spec::kThreadNum) void pipelining(void *__restrict_
   Tensor mC = make_tensor(make_gmem_ptr((ComputeTypeC *)Cptr), make_shape(M, N), make_stride(N, Int<1>{})); // (M, N)
   Tensor mO = make_tensor(make_gmem_ptr((OutType *)Outptr), make_shape(M, N), make_stride(N, Int<1>{}));    // (M, N)
 
-  auto tiler = make_tile(Int<kTileM>{}, Int<kTileN>{}, Int<kTileK>{});
+  auto tiler = make_tile(Int<kBlockM>{}, Int<kBlockN>{}, Int<kBlockK>{});
   auto coord = make_coord(bidy, bidx, _);
 
   Tensor gA = local_tile(mA, tiler, coord, Step<_1, X, _1>{}); // (BLK_M, BLK_K, K_TILES)
@@ -158,7 +158,7 @@ __global__ __launch_bounds__(Spec::kThreadNum) void pipelining(void *__restrict_
     copy_if(g2s_tiled_copy_c, tCpC_g2s, tCgC_g2s, tCsC_g2s);
   }
 
-  int NTilesK = ceil_div(K, kTileK);
+  int NTilesK = ceil_div(K, kBlockK);
 
   clear(tAsA_g2s);
   clear(tBsB_g2s);
@@ -349,9 +349,9 @@ template <typename OutType_,
           typename ComputeTypeA_,
           typename ComputeTypeB_,
           typename ComputeTypeC_,
-          int kTileM_,
-          int kTileN_,
-          int kTileK_,
+          int kBlockM_,
+          int kBlockN_,
+          int kBlockK_,
           int G2S_Stages_ = 3>
 struct KernelSpec {
   using OutType = OutType_;
@@ -359,9 +359,9 @@ struct KernelSpec {
   using ComputeTypeB = ComputeTypeB_;
   using ComputeTypeC = ComputeTypeC_;
 
-  static constexpr int kTileM = kTileM_;
-  static constexpr int kTileN = kTileN_;
-  static constexpr int kTileK = kTileK_;
+  static constexpr int kBlockM = kBlockM_;
+  static constexpr int kBlockN = kBlockN_;
+  static constexpr int kBlockK = kBlockK_;
 
   static constexpr int G2S_Stages = G2S_Stages_;
   static_assert(G2S_Stages >= 2, "G2S_Stages should not be less than 2.");
@@ -432,34 +432,24 @@ struct KernelSpec {
   using CopyO_S2G_atom = Copy_Atom<Copy_S2G_op, OutType>;
 
   static constexpr int kThreadNum = size(TiledMMA{});
-  static constexpr int kThreadsPerWarp = 32;
-  static constexpr int kTileM_Copy = cute::min(kThreadsPerWarp, kTileM);
-  static constexpr int kTileN_Copy = cute::min(kThreadsPerWarp, kTileN);
-
-  // Here we omit cases that `kAlignedCopyItems < 1`
-  static constexpr int kAlignedCopyItemsA =
-      cute::min(128 / 8 / sizeof(ComputeTypeA), kTileK *kTileM_Copy / kThreadNum);
-  static constexpr int kAlignedCopyItemsB =
-      cute::min(128 / 8 / sizeof(ComputeTypeB), kTileK *kTileN_Copy / kThreadNum);
-  static constexpr int kAlignedCopyItemsC =
-      cute::min(128 / 8 / sizeof(ComputeTypeC), kTileN *kTileM_Copy / kThreadNum);
-  static constexpr int kAlignedCopyItemsO = cute::min(128 / 8 / sizeof(OutType), kTileN *kTileM_Copy / kThreadNum);
+  static constexpr int kBlockK_Copy = cute::min(64, kBlockK) / 8;
+  static constexpr int kBlockN_Copy = cute::min(64, kBlockN) / 8;
 
   using TiledCopyA_G2S =
       decltype(make_tiled_copy(CopyA_G2S_atom{},
-                               make_layout(make_shape(Int<kTileM_Copy>{}, Int<kThreadNum / kTileM_Copy>{}),
-                                           make_stride(Int<kThreadNum / kTileM_Copy>{}, Int<1>{})),
-                               make_layout(make_shape(Int<1>{}, Int<kAlignedCopyItemsA>{}))));
+                               make_layout(make_shape(Int<kThreadNum / kBlockK_Copy>{}, Int<kBlockK_Copy>{}),
+                                           make_stride(Int<kBlockK_Copy>{}, Int<1>{})),
+                               make_layout(make_shape(Int<1>{}, Int<8>{}))));
   using TiledCopyB_G2S =
       decltype(make_tiled_copy(CopyB_G2S_atom{},
-                               make_layout(make_shape(Int<kTileN_Copy>{}, Int<kThreadNum / kTileN_Copy>{}),
-                                           make_stride(Int<kThreadNum / kTileN_Copy>{}, Int<1>{})),
-                               make_layout(make_shape(Int<1>{}, Int<kAlignedCopyItemsB>{}))));
+                               make_layout(make_shape(Int<kThreadNum / kBlockK_Copy>{}, Int<kBlockK_Copy>{}),
+                                           make_stride(Int<kBlockK_Copy>{}, Int<1>{})),
+                               make_layout(make_shape(Int<1>{}, Int<8>{}))));
   using TiledCopyC_G2S =
       decltype(make_tiled_copy(CopyC_G2S_atom{},
-                               make_layout(make_shape(Int<kTileM_Copy>{}, Int<kThreadNum / kTileM_Copy>{}),
-                                           make_stride(Int<kThreadNum / kTileM_Copy>{}, Int<1>{})),
-                               make_layout(make_shape(Int<1>{}, Int<kAlignedCopyItemsC>{}))));
+                               make_layout(make_shape(Int<kThreadNum / kBlockN_Copy>{}, Int<kBlockN_Copy>{}),
+                                           make_stride(Int<kBlockN_Copy>{}, Int<1>{})),
+                               make_layout(make_shape(Int<1>{}, Int<8>{}))));
 
   using TiledCopyA_S2R = decltype(make_tiled_copy_A(CopyA_S2R_atom{}, TiledMMA{}));
   using TiledCopyB_S2R = decltype(make_tiled_copy_B(CopyB_S2R_atom{}, TiledMMA{}));
@@ -470,28 +460,28 @@ struct KernelSpec {
 
   using TiledCopyC_S2G =
       decltype(make_tiled_copy(CopyC_S2G_atom{},
-                               make_layout(make_shape(Int<kTileM_Copy>{}, Int<kThreadNum / kTileM_Copy>{}),
-                                           make_stride(Int<kThreadNum / kTileM_Copy>{}, Int<1>{})),
-                               make_layout(make_shape(Int<1>{}, Int<kAlignedCopyItemsC>{}))));
+                               make_layout(make_shape(Int<kThreadNum / kBlockN_Copy>{}, Int<kBlockN_Copy>{}),
+                                           make_stride(Int<kBlockN_Copy>{}, Int<1>{})),
+                               make_layout(make_shape(Int<1>{}, Int<8>{}))));
   using TiledCopyO_S2G =
       decltype(make_tiled_copy(CopyO_S2G_atom{},
-                               make_layout(make_shape(Int<kTileM_Copy>{}, Int<kThreadNum / kTileM_Copy>{}),
-                                           make_stride(Int<kThreadNum / kTileM_Copy>{}, Int<1>{})),
-                               make_layout(make_shape(Int<1>{}, Int<kAlignedCopyItemsO>{}))));
+                               make_layout(make_shape(Int<kThreadNum / kBlockN_Copy>{}, Int<kBlockN_Copy>{}),
+                                           make_stride(Int<kBlockN_Copy>{}, Int<1>{})),
+                               make_layout(make_shape(Int<1>{}, Int<8>{}))));
 
   using SmemLayoutAtomAB = decltype(composition(Swizzle<3, 3, 3>{},
-                                                make_layout(make_shape(Int<8>{}, Int<cute::min(64, kTileK)>{}),
-                                                            make_stride(Int<cute::min(64, kTileK)>{}, Int<1>{}))));
+                                                make_layout(make_shape(Int<8>{}, Int<cute::min(64, kBlockK)>{}),
+                                                            make_stride(Int<cute::min(64, kBlockK)>{}, Int<1>{}))));
   using SmemLayoutAtomC = decltype(composition(Swizzle<3, 3, 3>{},
-                                               make_layout(make_shape(Int<8>{}, Int<cute::min(64, kTileN)>{}),
-                                                           make_stride(Int<cute::min(64, kTileN)>{}, Int<1>{}))));
+                                               make_layout(make_shape(Int<8>{}, Int<cute::min(64, kBlockN)>{}),
+                                                           make_stride(Int<cute::min(64, kBlockN)>{}, Int<1>{}))));
 
   using SmemLayoutA =
-      decltype(tile_to_shape(SmemLayoutAtomAB{}, make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<G2S_Stages>{})));
+      decltype(tile_to_shape(SmemLayoutAtomAB{}, make_shape(Int<kBlockM>{}, Int<kBlockK>{}, Int<G2S_Stages>{})));
   using SmemLayoutB =
-      decltype(tile_to_shape(SmemLayoutAtomAB{}, make_shape(Int<kTileN>{}, Int<kTileK>{}, Int<G2S_Stages>{})));
-  using SmemLayoutC = decltype(tile_to_shape(SmemLayoutAtomC{}, make_shape(Int<kTileM>{}, Int<kTileN>{})));
-  using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomC{}, make_shape(Int<kTileM>{}, Int<kTileN>{})));
+      decltype(tile_to_shape(SmemLayoutAtomAB{}, make_shape(Int<kBlockN>{}, Int<kBlockK>{}, Int<G2S_Stages>{})));
+  using SmemLayoutC = decltype(tile_to_shape(SmemLayoutAtomC{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
+  using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomC{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
 
   static constexpr int kShmSizeA = cosize_v<SmemLayoutA> * sizeof(ComputeTypeA);
   static constexpr int kShmSizeB = cosize_v<SmemLayoutB> * sizeof(ComputeTypeB);
@@ -550,9 +540,9 @@ template <typename ComputeTypeC, typename OutType> constexpr bool needs_precisio
   return !std::is_same_v<ComputeTypeC, OutType>;
 }
 
-template <int kTileM,
-          int kTileN,
-          int kTileK,
+template <int kBlockM,
+          int kBlockN,
+          int kBlockK,
           int G2S_Stages,
           typename OutType,
           typename ComputeTypeA,
@@ -602,10 +592,10 @@ torch::Tensor run_pipelining(const torch::Tensor a, const torch::Tensor b, std::
     CHECK_TORCH_TENSOR_SHAPE(out, M, N)
   }
 
-  using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, kTileM, kTileN, kTileK, G2S_Stages>;
+  using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, kBlockM, kBlockN, kBlockK, G2S_Stages>;
 
   dim3 block = Spec::kThreadNum;
-  dim3 grid(cute::ceil_div(N, Spec::kTileN), cute::ceil_div(M, Spec::kTileM));
+  dim3 grid(cute::ceil_div(N, Spec::kBlockN), cute::ceil_div(M, Spec::kBlockM));
 
   constexpr int kShmSizeA = Spec::kShmSizeA;
   constexpr int kShmSizeB = Spec::kShmSizeB;

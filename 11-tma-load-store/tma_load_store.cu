@@ -61,9 +61,9 @@ __global__ __launch_bounds__(Spec::kThreadNum) void tma_load_store(__grid_consta
   using SmemLayoutC = typename Spec::SmemLayoutC;
   using SmemLayoutD = typename Spec::SmemLayoutD;
 
-  constexpr int kTileM = Spec::kTileM;
-  constexpr int kTileN = Spec::kTileN;
-  constexpr int kTileK = Spec::kTileK;
+  constexpr int kBlockM = Spec::kBlockM;
+  constexpr int kBlockN = Spec::kBlockN;
+  constexpr int kBlockK = Spec::kBlockK;
 
   extern __shared__ __align__(1024) uint8_t smem_raw[];
 
@@ -92,7 +92,7 @@ __global__ __launch_bounds__(Spec::kThreadNum) void tma_load_store(__grid_consta
   Tensor mC = tma_C.get_tma_tensor(make_shape(M, N));
   Tensor mD = tma_D.get_tma_tensor(make_shape(M, N));
 
-  auto tiler = make_tile(Int<kTileM>{}, Int<kTileN>{}, Int<kTileK>{});
+  auto tiler = make_tile(Int<kBlockM>{}, Int<kBlockN>{}, Int<kBlockK>{});
   auto coord = make_coord(bidy, bidx, _);
 
   Tensor gA = local_tile(mA, tiler, coord, Step<_1, X, _1>{}); // (BLK_M, BLK_K, K_TILES)
@@ -115,7 +115,7 @@ __global__ __launch_bounds__(Spec::kThreadNum) void tma_load_store(__grid_consta
                                     group_modes<0, 2>(gD)); // (TMA,K_TILES) and (TMA)
 
   constexpr int tma_transaction_bytes =
-      kTileM * kTileK * sizeof(ComputeTypeA) + kTileN * kTileK * sizeof(ComputeTypeB);
+      kBlockM * kBlockK * sizeof(ComputeTypeA) + kBlockN * kBlockK * sizeof(ComputeTypeB);
 
   typename Spec::TiledMMA tiled_mma;
   ThrMMA thr_mma = tiled_mma.get_slice(tid);
@@ -140,7 +140,7 @@ __global__ __launch_bounds__(Spec::kThreadNum) void tma_load_store(__grid_consta
   // MAINLOOP
   //
 
-  int NTilesK = ceil_div(K, kTileK);
+  int NTilesK = ceil_div(K, kBlockK);
 
   int warp_idx = cutlass::canonical_warp_idx_sync();
   int lane_predicate = cute::elect_one_sync();
@@ -186,7 +186,7 @@ __global__ __launch_bounds__(Spec::kThreadNum) void tma_load_store(__grid_consta
 
   if constexpr (!IsGemm) {
     // Load C matrix with TMA
-    constexpr int tma_transaction_load_c_bytes = kTileM * kTileN * sizeof(ComputeTypeC);
+    constexpr int tma_transaction_load_c_bytes = kBlockM * kBlockN * sizeof(ComputeTypeC);
     using SharedStorage_C = SharedStorage_C<ComputeTypeC, SmemLayoutC>;
     SharedStorage_C &smem_c = *reinterpret_cast<SharedStorage_C *>(smem_raw);
     uint64_t &tma_load_c_mbarrier = smem_c.tma_barrier[0];
@@ -251,18 +251,18 @@ template <typename OutType_,
           typename ComputeTypeA_,
           typename ComputeTypeB_,
           typename ComputeTypeC_,
-          int kTileM_ = 128,
-          int kTileN_ = 128,
-          int kTileK_ = 64>
+          int kBlockM_ = 128,
+          int kBlockN_ = 128,
+          int kBlockK_ = 64>
 struct KernelSpec {
   using OutType = OutType_;
   using ComputeTypeA = ComputeTypeA_;
   using ComputeTypeB = ComputeTypeB_;
   using ComputeTypeC = ComputeTypeC_;
 
-  static constexpr int kTileM = kTileM_;
-  static constexpr int kTileN = kTileN_;
-  static constexpr int kTileK = kTileK_;
+  static constexpr int kBlockM = kBlockM_;
+  static constexpr int kBlockN = kBlockN_;
+  static constexpr int kBlockK = kBlockK_;
 
   using MMA_op = std::conditional_t<
       std::is_same_v<ComputeTypeA, cute::bfloat16_t> && std::is_same_v<ComputeTypeB, cute::bfloat16_t> &&
@@ -326,22 +326,22 @@ struct KernelSpec {
   // Before Layout A: Sw<3,4,3> o _0 o ((_8,_16),(_64,_1)):((_64,_512),(_1,_0))
   // After  Layout A: Sw<3,4,3> o smem_ptr[16b](unset) o ((_8,_16),(_64,_1)):((_64,_512),(_1,_0))
   using SmemLayoutA = decltype(tile_to_shape(
-      GMMA::Layout_K_SW128_Atom<ComputeTypeA>{}, make_shape(Int<kTileM>{}, Int<kTileK>{}), Step<_1, _2>{}));
+      GMMA::Layout_K_SW128_Atom<ComputeTypeA>{}, make_shape(Int<kBlockM>{}, Int<kBlockK>{}), Step<_1, _2>{}));
   // Also we can use:
   // using SmemLayoutAtomA = decltype(composition(
   //                                     Swizzle<3, 4, 3>{},
   //                                     smem_ptr_flag_bits<sizeof_bits<ComputeTypeA>::value>{},
-  //                                     make_layout(make_shape(Int<8>{}, Int<cute::min(64, kTileK)>{}),
-  //                                                 make_stride(Int<cute::min(64, kTileK)>{}, Int<1>{}))));
+  //                                     make_layout(make_shape(Int<8>{}, Int<cute::min(64, kBlockK)>{}),
+  //                                                 make_stride(Int<cute::min(64, kBlockK)>{}, Int<1>{}))));
   // using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtomA{},
-  //                                            make_shape(Int<kTileM>{}, Int<kTileK>{}),
+  //                                            make_shape(Int<kBlockM>{}, Int<kBlockK>{}),
   //                                            Step<_1,_2>{}));
   using SmemLayoutB = decltype(tile_to_shape(
-      GMMA::Layout_K_SW128_Atom<ComputeTypeB>{}, make_shape(Int<kTileN>{}, Int<kTileK>{}), Step<_1, _2>{}));
+      GMMA::Layout_K_SW128_Atom<ComputeTypeB>{}, make_shape(Int<kBlockN>{}, Int<kBlockK>{}), Step<_1, _2>{}));
   using SmemLayoutC = decltype(tile_to_shape(
-      GMMA::Layout_K_SW128_Atom<ComputeTypeC>{}, make_shape(Int<kTileM>{}, Int<kTileN>{}), Step<_1, _2>{}));
+      GMMA::Layout_K_SW128_Atom<ComputeTypeC>{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{}), Step<_1, _2>{}));
   using SmemLayoutD = decltype(tile_to_shape(
-      GMMA::Layout_K_SW128_Atom<OutType>{}, make_shape(Int<kTileM>{}, Int<kTileN>{}), Step<_1, _2>{}));
+      GMMA::Layout_K_SW128_Atom<OutType>{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{}), Step<_1, _2>{}));
 
   static constexpr int kShmSizeA = cosize_v<SmemLayoutA> * sizeof(ComputeTypeA);
   static constexpr int kShmSizeB = cosize_v<SmemLayoutB> * sizeof(ComputeTypeB);
@@ -400,9 +400,9 @@ template <typename T> constexpr torch::ScalarType to_torch_scalar_type() {
     throw std::runtime_error("Unsupported type!");
 }
 
-template <int kTileM,
-          int kTileN,
-          int kTileK,
+template <int kBlockM,
+          int kBlockN,
+          int kBlockK,
           typename OutType,
           typename ComputeTypeA,
           typename ComputeTypeB,
@@ -445,10 +445,10 @@ torch::Tensor run_tma_load_store(const torch::Tensor a, const torch::Tensor b, s
   if (!is_gemm) CHECK_TORCH_TENSOR_SHAPE(c, M, N)
   CHECK_TORCH_TENSOR_SHAPE(d, M, N)
 
-  using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, kTileM, kTileN, kTileK>;
+  using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, kBlockM, kBlockN, kBlockK>;
 
   dim3 block = Spec::kThreadNum;
-  dim3 grid(cute::ceil_div(N, Spec::kTileN), cute::ceil_div(M, Spec::kTileM));
+  dim3 grid(cute::ceil_div(N, Spec::kBlockN), cute::ceil_div(M, Spec::kBlockM));
   int shm_size = Spec::kShmSize;
 
   printf("Block Size: (%d, %d, %d) | Grid Size: (%d, %d, %d) | Shared Memory Size: %d Bytes\n", block.x, block.y,
@@ -472,7 +472,7 @@ torch::Tensor run_tma_load_store(const torch::Tensor a, const torch::Tensor b, s
   auto smem_layout_D = typename Spec::SmemLayoutD{};
 
   auto tma_A = make_tma_copy(SM90_TMA_LOAD{}, mA, smem_layout_A);
-  // auto tma_A = make_tma_atom(SM90_TMA_LOAD{}, mA, smem_layout_A, make_shape(kTileM,kTileK));
+  // auto tma_A = make_tma_atom(SM90_TMA_LOAD{}, mA, smem_layout_A, make_shape(kBlockM,kBlockK));
   auto tma_B = make_tma_copy(SM90_TMA_LOAD{}, mB, smem_layout_B);
   auto tma_C = make_tma_copy(SM90_TMA_LOAD{}, mC, smem_layout_C);
   auto tma_D = make_tma_copy(SM90_TMA_STORE{}, mD, smem_layout_D);
