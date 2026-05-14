@@ -592,7 +592,8 @@ torch::Tensor run_pipelining(const torch::Tensor a, const torch::Tensor b, std::
     CHECK_TORCH_TENSOR_SHAPE(out, M, N)
   }
 
-  using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, kBlockM, kBlockN, kBlockK, G2S_Stages>;
+  using Spec =
+      spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, kBlockM, kBlockN, kBlockK, G2S_Stages>;
 
   dim3 block = Spec::kThreadNum;
   dim3 grid(cute::ceil_div(N, Spec::kBlockN), cute::ceil_div(M, Spec::kBlockM));

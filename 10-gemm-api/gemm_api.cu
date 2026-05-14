@@ -335,8 +335,8 @@ torch::Tensor run_gemm_api(const torch::Tensor a, const torch::Tensor b, std::op
     CHECK_TORCH_TENSOR_SHAPE(out, M, N)
   }
 
-  using Spec =
-      spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, AccType, kBlockM, kBlockN, kBlockK, G2S_Stages>;
+  using Spec = spec::KernelSpec<OutType, ComputeTypeA, ComputeTypeB, ComputeTypeC, AccType, kBlockM, kBlockN, kBlockK,
+                                G2S_Stages>;
 
   void *out_ptr = IsCvtPrecision ? out.data_ptr() : c.data_ptr();
 
