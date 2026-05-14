@@ -17,9 +17,9 @@ CuTe DSL counterpart of ``dynamic_mma.cu`` / ``dynamic_mma.py``. Extends
 
 The swizzled smem path from ``07-swizzling`` is reused verbatim:
 ``Swizzle<3,3,3>`` composed with an ``(8 x min(64, kBlockK))`` atom,
-then tiled to ``(kBlockM, kBlockK, 1)`` / ``(kBlockN, kBlockK, 1)``
-ComposedLayouts handed to ``allocate_tensor``. The single-stage form
-keeps the kernel oblivious to multi-staging.
+then tiled to ``(kBlockM, kBlockK)`` / ``(kBlockN, kBlockK)``
+ComposedLayouts handed to ``allocate_tensor``. No pipelining here, so
+plain 2D smem layouts suffice.
 
 Three dtype specializations are exercised, matching ``dynamic_mma.py``:
 
@@ -115,11 +115,11 @@ def dynamic_mma_kernel(
     # ----- G2S partitions (predicated) -----
     thr_g2s_a = g2s_tiled_copy_a.get_slice(tid)
     tAgA = thr_g2s_a.partition_S(gA)  # (CPY, CPY_M, CPY_K, k_tiles)
-    tAsA = thr_g2s_a.partition_D(sA)  # (CPY, CPY_M, CPY_K, 1)
+    tAsA = thr_g2s_a.partition_D(sA)  # (CPY, CPY_M, CPY_K)
 
     thr_g2s_b = g2s_tiled_copy_b.get_slice(tid)
     tBgB = thr_g2s_b.partition_S(gB)  # (CPY, CPY_N, CPY_K, k_tiles)
-    tBsB = thr_g2s_b.partition_D(sB)  # (CPY, CPY_N, CPY_K, 1)
+    tBsB = thr_g2s_b.partition_D(sB)  # (CPY, CPY_N, CPY_K)
 
     thr_g2s_c = g2s_tiled_copy_c.get_slice(tid)
     tCgC = thr_g2s_c.partition_S(gC)  # (CPY, CPY_M, CPY_N)
@@ -193,8 +193,8 @@ def dynamic_mma_kernel(
 
     # ----- Fragments -----
     thr_mma = tiled_mma.get_slice(tid)
-    tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA)[None, None, None, 0])
-    tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB)[None, None, None, 0])
+    tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA))
+    tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))
     tCrC = tiled_mma.make_fragment_C(thr_mma.partition_C(gC))
 
     # S2R partitions reuse the same tiled_mma so the fragment layouts match
@@ -286,13 +286,13 @@ def dynamic_mma_kernel(
     cute.copy(
         g2s_tiled_copy_a,
         tAgA[None, None, None, 0],
-        tAsA[None, None, None, 0],
+        tAsA,
         pred=tApA_first,
     )
     cute.copy(
         g2s_tiled_copy_b,
         tBgB[None, None, None, 0],
-        tBsB[None, None, None, 0],
+        tBsB,
         pred=tBpB_first,
     )
     cute.arch.cp_async_commit_group()
@@ -318,12 +318,12 @@ def dynamic_mma_kernel(
 
     cute.copy(
         s2r_tiled_copy_a,
-        thr_s2r_a.partition_S(sA)[None, None, None, 0],
+        thr_s2r_a.partition_S(sA),
         thr_s2r_a.retile(tCrA),
     )
     cute.copy(
         s2r_tiled_copy_b,
-        thr_s2r_b.partition_S(sB)[None, None, None, 0],
+        thr_s2r_b.partition_S(sB),
         thr_s2r_b.retile(tCrB),
     )
     cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)
@@ -337,13 +337,13 @@ def dynamic_mma_kernel(
         cute.copy(
             g2s_tiled_copy_a,
             tAgA[None, None, None, ik + 1],
-            tAsA[None, None, None, 0],
+            tAsA,
             pred=tApA,
         )
         cute.copy(
             g2s_tiled_copy_b,
             tBgB[None, None, None, ik + 1],
-            tBsB[None, None, None, 0],
+            tBsB,
             pred=tBpB,
         )
         cute.arch.cp_async_commit_group()
@@ -352,12 +352,12 @@ def dynamic_mma_kernel(
 
         cute.copy(
             s2r_tiled_copy_a,
-            thr_s2r_a.partition_S(sA)[None, None, None, 0],
+            thr_s2r_a.partition_S(sA),
             thr_s2r_a.retile(tCrA),
         )
         cute.copy(
             s2r_tiled_copy_b,
-            thr_s2r_b.partition_S(sB)[None, None, None, 0],
+            thr_s2r_b.partition_S(sB),
             thr_s2r_b.retile(tCrB),
         )
         cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)
@@ -387,7 +387,7 @@ def dynamic_mma_kernel(
     # R2S: register fragment -> swizzled smem buffer sO.
     thr_r2s_o = r2s_tiled_copy_o.get_slice(tid)
     tOrO_r2s = thr_r2s_o.retile(tCrO)
-    tOsO_r2s = thr_r2s_o.partition_D(sO[None, None, 0])
+    tOsO_r2s = thr_r2s_o.partition_D(sO)
     cute.copy(r2s_tiled_copy_o, tOrO_r2s, tOsO_r2s)
 
     cute.arch.sync_threads()
@@ -401,7 +401,7 @@ def dynamic_mma_kernel(
     # rest_v mode size 1 with stride 0 so the same scalar is replayed
     # across the (trivial) CPY mode at the IR level.
     thr_s2g_o = s2g_tiled_copy_o.get_slice(tid)
-    tOsO_s2g = thr_s2g_o.partition_S(sO[None, None, 0])
+    tOsO_s2g = thr_s2g_o.partition_S(sO)
     tOgO_s2g = thr_s2g_o.partition_D(gO)
     tOcO_s2g = thr_s2g_o.partition_S(cC)
 
@@ -458,8 +458,8 @@ def dynamic_mma_gemm(
         0,
         cute.make_layout((8, inner_AB), stride=(inner_AB, 1)),
     )
-    sA_layout = cute.tile_to_shape(atom_AB, (BLK_M, BLK_K, 1), order=(0, 1, 2))
-    sB_layout = cute.tile_to_shape(atom_AB, (BLK_N, BLK_K, 1), order=(0, 1, 2))
+    sA_layout = cute.tile_to_shape(atom_AB, (BLK_M, BLK_K), order=(0, 1))
+    sB_layout = cute.tile_to_shape(atom_AB, (BLK_N, BLK_K), order=(0, 1))
     sC_layout = cute.make_layout((BLK_M, BLK_N), stride=(BLK_N, 1))
     # sO mirrors dynamic_mma.cu's SmemLayoutO: Swizzle<3,3,3> o (8 x min(64, BLK_N)).
     inner_O = min(64, BLK_N)
@@ -468,7 +468,7 @@ def dynamic_mma_gemm(
         0,
         cute.make_layout((8, inner_O), stride=(inner_O, 1)),
     )
-    sO_layout = cute.tile_to_shape(atom_O, (BLK_M, BLK_N, 1), order=(0, 1, 2))
+    sO_layout = cute.tile_to_shape(atom_O, (BLK_M, BLK_N), order=(0, 1))
 
     # ----- G2S copies (cp.async) -----
     g2s_op = cute.nvgpu.cpasync.CopyG2SOp(

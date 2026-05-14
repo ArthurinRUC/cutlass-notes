@@ -7,20 +7,17 @@ ingredient is swizzled smem layouts on A and B, which kill the bank
 conflicts that the strided ldmatrix pattern would otherwise generate:
 
   swizzle_atom = Swizzle<3,3,3> o (8 x min(64, kBlockK)):(min(64, kBlockK), 1)
-  sA_layout    = tile_to_shape(swizzle_atom, (kBlockM, kBlockK, 1), order=(0,1,2))
-  sB_layout    = tile_to_shape(swizzle_atom, (kBlockN, kBlockK, 1), order=(0,1,2))
+  sA_layout    = tile_to_shape(swizzle_atom, (kBlockM, kBlockK))
+  sB_layout    = tile_to_shape(swizzle_atom, (kBlockN, kBlockK))
 
 and 16-bit-wide ``ldmatrix`` ops (``cute.nvgpu.warp.LdMatrix8x8x16bOp``)
 on the S2R copies.
 
-The 3D ``tile_to_shape`` form (with a degenerate pipeline-stage dim of 1)
-mirrors the canonical CuTe DSL recipe from
-``cutlass/examples/python/CuTeDSL/ampere/tensorop_gemm.py``: the full
-``ComposedLayout`` is handed to ``allocate_tensor`` directly so the
-allocator sees the swizzle composition. Because ``gA``/``gB`` here are
-2D (single-iteration, no K-tiling), the partitioned smem tensors are
-sliced with ``[None, None, None, 0]`` on the stage dim before each
-``cute.copy`` to rank-match against the 2D global partitions.
+The full ``ComposedLayout`` is handed to ``allocate_tensor`` directly so
+the allocator sees the swizzle composition. Since this kernel has no
+pipelining, the smem layouts are plain 2D — ``(BLK_M, BLK_K)`` for A and
+B, ``(BLK_M, BLK_N)`` for O — matching the 2D ``gA`` / ``gB`` / ``gO``
+tiles 1:1.
 
 Three dtype specs are exercised, matching ``swizzling.py``:
 
@@ -96,11 +93,8 @@ def swizzling_kernel(
     gO = cute.local_tile(mO, tiler=(M, N), coord=(0, 0))
 
     # ----- Smem allocation (swizzled atoms for A, B, O; non-swizzled for C) -----
-    # ``sA_layout`` / ``sB_layout`` / ``sO_layout`` are 3D ``ComposedLayout``s
-    # with a degenerate stage dim of 1 (mirrors tensorop_gemm.py). The
-    # partitioned smem tensors are sliced with ``[None, None, None, 0]``
-    # before each ``cute.copy`` to rank-match against the 2D global
-    # partitions.
+    # ``sA_layout`` / ``sB_layout`` / ``sO_layout`` are 2D ``ComposedLayout``s
+    # matching the 2D gA / gB / gO tiles directly. No pipeline-stage dim.
     smem = cutlass.utils.SmemAllocator()
     sA = smem.allocate_tensor(mA.element_type, sA_layout, byte_alignment=16)
     sB = smem.allocate_tensor(mB.element_type, sB_layout, byte_alignment=16)
@@ -112,14 +106,14 @@ def swizzling_kernel(
     cute.copy(
         g2s_tiled_copy_a,
         thr_g2s_a.partition_S(gA),
-        thr_g2s_a.partition_D(sA)[None, None, None, 0],
+        thr_g2s_a.partition_D(sA),
     )
 
     thr_g2s_b = g2s_tiled_copy_b.get_slice(tid)
     cute.copy(
         g2s_tiled_copy_b,
         thr_g2s_b.partition_S(gB),
-        thr_g2s_b.partition_D(sB)[None, None, None, 0],
+        thr_g2s_b.partition_D(sB),
     )
 
     if cutlass.const_expr(not is_gemm):
@@ -132,22 +126,22 @@ def swizzling_kernel(
 
     # ----- Fragments -----
     thr_mma = tiled_mma.get_slice(tid)
-    tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA)[None, None, None, 0])
-    tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB)[None, None, None, 0])
+    tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA))
+    tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))
     tCrC = tiled_mma.make_fragment_C(thr_mma.partition_C(gC))
 
     # ----- Phase 2: smem -> rmem via ldmatrix-backed TiledCopies -----
     thr_s2r_a = s2r_tiled_copy_a.get_slice(tid)
     cute.copy(
         s2r_tiled_copy_a,
-        thr_s2r_a.partition_S(sA)[None, None, None, 0],
+        thr_s2r_a.partition_S(sA),
         thr_s2r_a.retile(tCrA),
     )
 
     thr_s2r_b = s2r_tiled_copy_b.get_slice(tid)
     cute.copy(
         s2r_tiled_copy_b,
-        thr_s2r_b.partition_S(sB)[None, None, None, 0],
+        thr_s2r_b.partition_S(sB),
         thr_s2r_b.retile(tCrB),
     )
 
@@ -180,7 +174,7 @@ def swizzling_kernel(
     # R2S: register fragment -> swizzled smem buffer sO.
     thr_r2s_o = r2s_tiled_copy_o.get_slice(tid)
     tOrO_r2s = thr_r2s_o.retile(tCrO)
-    tOsO_r2s = thr_r2s_o.partition_D(sO[None, None, 0])
+    tOsO_r2s = thr_r2s_o.partition_D(sO)
     cute.copy(r2s_tiled_copy_o, tOrO_r2s, tOsO_r2s)
 
     cute.arch.sync_threads()
@@ -189,7 +183,7 @@ def swizzling_kernel(
     # along the N dim, matching swizzling.cu's TiledCopyO_S2G. Single
     # (1, 1, 1) grid means no M/N residues — no S2G predicate needed.
     thr_s2g_o = s2g_tiled_copy_o.get_slice(tid)
-    tOsO_s2g = thr_s2g_o.partition_S(sO[None, None, 0])
+    tOsO_s2g = thr_s2g_o.partition_S(sO)
     tOgO_s2g = thr_s2g_o.partition_D(gO)
     cute.copy(s2g_tiled_copy_o, tOsO_s2g, tOgO_s2g)
 
@@ -221,9 +215,8 @@ def swizzling_gemm(
     )
 
     # ----- Swizzled smem layouts (matches the C++ Swizzle<3,3,3>) -----
-    # 3D-tiler form with a degenerate stage dim of 1 — the canonical CuTe DSL
-    # recipe (see ``tensorop_gemm.py``). The kernel slices the stage off after
-    # allocation so consumers see 2D smem tensors.
+    # Plain 2D ComposedLayouts — no pipelining in this kernel, so no
+    # degenerate stage dim is needed.
     swz = cute.make_swizzle(3, 3, 3)
     inner_AB = min(64, K)
     atom_AB = cute.make_composed_layout(
@@ -231,8 +224,8 @@ def swizzling_gemm(
         0,
         cute.make_layout((8, inner_AB), stride=(inner_AB, 1)),
     )
-    sA_layout = cute.tile_to_shape(atom_AB, (M, K, 1), order=(0, 1, 2))
-    sB_layout = cute.tile_to_shape(atom_AB, (N, K, 1), order=(0, 1, 2))
+    sA_layout = cute.tile_to_shape(atom_AB, (M, K), order=(0, 1))
+    sB_layout = cute.tile_to_shape(atom_AB, (N, K), order=(0, 1))
     # The C preload buffer doesn't need swizzling for our flow; use a plain
     # row-major layout.
     sC_layout = cute.make_layout((M, N), stride=(N, 1))
@@ -243,7 +236,7 @@ def swizzling_gemm(
         0,
         cute.make_layout((8, inner_O), stride=(inner_O, 1)),
     )
-    sO_layout = cute.tile_to_shape(atom_O, (M, N, 1), order=(0, 1, 2))
+    sO_layout = cute.tile_to_shape(atom_O, (M, N), order=(0, 1))
 
     # ----- G2S tiled copies (cp.async) -----
     g2s_op = cute.nvgpu.cpasync.CopyG2SOp(
