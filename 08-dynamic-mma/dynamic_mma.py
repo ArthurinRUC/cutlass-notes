@@ -93,7 +93,7 @@ def compare_matrix(kernel_output: torch.Tensor, torch_output: torch.Tensor):
 
 # Note: N and K must be multiples of 8 to remain compatible with the 128-bit vectorized copy op.
 Ms = [16, 64, 128, 192, 256, 1024, 4096]
-Ns = [16, 128, 192, 256, 1024, 4096]
+Ns = [16, 64, 128, 192, 256, 1024, 4096]
 Ks = [16, 64, 128, 192, 256, 1024, 4096]
 exps = [(m, n, k) for m in Ms for n in Ns for k in Ks]
 
