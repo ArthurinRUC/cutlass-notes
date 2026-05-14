@@ -22,9 +22,14 @@ allocator sees the swizzle composition. Because ``gA``/``gB`` here are
 sliced with ``[None, None, None, 0]`` on the stage dim before each
 ``cute.copy`` to rank-match against the 2D global partitions.
 
-For consistency with the other ports, the bf16 -> fp32 -> bf16 config is
-exercised here. The epilogue mirrors ``swizzling.cu``'s ``TiledCopyO_R2S``
-/ ``TiledCopyO_S2G`` pair: accumulator is narrowed to out_dtype in
+Three dtype specs are exercised, matching ``swizzling.py``:
+
+  * fp16 in, fp32 acc, fp16 out  (validated)
+  * fp16 in, fp16 acc, fp16 out  (exercise only)
+  * bf16 in, fp32 acc, bf16 out  (validated)
+
+The epilogue mirrors ``swizzling.cu``'s ``TiledCopyO_R2S`` /
+``TiledCopyO_S2G`` pair: accumulator is narrowed to out_dtype in
 registers, R2S'd into a swizzled smem buffer sO (Swizzle<3,3,3> o
 (8 x min(64, BLK_N))), then drained to gmem with a contiguous-N TV
 layout. Single (1, 1, 1) grid means no M/N residues to predicate; the
@@ -79,6 +84,7 @@ def swizzling_kernel(
     sB_layout: cute.ComposedLayout,
     sC_layout: cute.Layout,
     sO_layout: cute.ComposedLayout,
+    acc_dtype: cutlass.Constexpr,
     out_dtype: cutlass.Constexpr,
     is_gemm: cutlass.Constexpr[bool],
 ):
@@ -96,9 +102,9 @@ def swizzling_kernel(
     # before each ``cute.copy`` to rank-match against the 2D global
     # partitions.
     smem = cutlass.utils.SmemAllocator()
-    sA = smem.allocate_tensor(cutlass.BFloat16, sA_layout, byte_alignment=16)
-    sB = smem.allocate_tensor(cutlass.BFloat16, sB_layout, byte_alignment=16)
-    sC = smem.allocate_tensor(cutlass.Float32, sC_layout, byte_alignment=16)
+    sA = smem.allocate_tensor(mA.element_type, sA_layout, byte_alignment=16)
+    sB = smem.allocate_tensor(mB.element_type, sB_layout, byte_alignment=16)
+    sC = smem.allocate_tensor(mC.element_type, sC_layout, byte_alignment=16)
     sO = smem.allocate_tensor(out_dtype, sO_layout, byte_alignment=16)
 
     # ----- Phase 1: gmem -> smem via cp.async -----
@@ -148,12 +154,20 @@ def swizzling_kernel(
     if cutlass.const_expr(is_gemm):
         tCrC.fill(0.0)
     else:
+        # Load C from smem in its native dtype (mC.element_type), then convert
+        # into the accumulator fragment. The intermediate is required when
+        # acc_dtype differs from mC.element_type (e.g. fp16->fp32): the DSL's
+        # ``cute.copy`` requires source/destination bit widths to match, so
+        # the dtype change has to happen on a register-to-register ``.to()``
+        # step. When acc_dtype == mC.element_type this is a no-op cast.
         thr_s2r_c = s2r_tiled_copy_c.get_slice(tid)
+        tCrC_pre = cute.make_fragment_like(tCrC, mC.element_type)
         cute.copy(
             s2r_tiled_copy_c,
             thr_s2r_c.partition_S(sC),
-            thr_s2r_c.retile(tCrC),
+            thr_s2r_c.retile(tCrC_pre),
         )
+        tCrC.store(tCrC_pre.load().to(acc_dtype))
 
     # ----- Phase 3: compute -----
     cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)
@@ -187,13 +201,17 @@ def swizzling_gemm(
     mC: cute.Tensor,
     mO: cute.Tensor,
     stream: CUstream,
+    acc_dtype: cutlass.Constexpr,
     out_dtype: cutlass.Constexpr,
     is_gemm: cutlass.Constexpr[bool],
 ):
     # ----- Tiled MMA -----
+    # MmaF16BF16Op handles both fp16 and bf16 input dtypes — the input/acc
+    # dtype pair (e.g. fp16/fp32, fp16/fp16, bf16/fp32) selects the
+    # underlying SM80_16x8x16 PTX op.
     op = cute.nvgpu.warp.MmaF16BF16Op(
-        cutlass.BFloat16,
-        cutlass.Float32,
+        mA.element_type,
+        acc_dtype,
         MMA_INST_MNK,
     )
     tm = cute.make_tiled_mma(
@@ -231,28 +249,28 @@ def swizzling_gemm(
     g2s_op = cute.nvgpu.cpasync.CopyG2SOp(
         cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL,
     )
-    # The block has NUM_THREADS = 128 threads. We follow the C++ recipe:
-    # ``kBlockK_Copy = min(64, kBlockK) / 8 = 8`` -> thread layout (16, 8) with
-    # stride (8, 1), and value layout (1, 8) so each thread covers 8 elems
-    # along the contiguous inner dim per TV iteration.
-    block_k_copy = min(64, K) // 8
-    block_n_copy = min(64, N) // 8
+    # AB copy is along (M/N, K). 128-bit cp.async loads 16B/thread =
+    # 16 / sizeof(elt) elements along K per TV iteration.
+    elt_bytes_ab = mA.element_type.width // 8
+    block_k_copy = min(64, K) // (16 // elt_bytes_ab)
     tlAB_thr = cute.make_layout(
         (NUM_THREADS // block_k_copy, block_k_copy),
         stride=(block_k_copy, 1),
     )
-    tlAB_val = cute.make_layout((1, 8))
+    tlAB_val = cute.make_layout((1, 16 // elt_bytes_ab))
     g2s_atom_a = cute.make_copy_atom(g2s_op, mA.element_type, num_bits_per_copy=128)
     g2s_atom_b = cute.make_copy_atom(g2s_op, mB.element_type, num_bits_per_copy=128)
     g2s_tiled_copy_a = cute.make_tiled_copy_tv(g2s_atom_a, tlAB_thr, tlAB_val)
     g2s_tiled_copy_b = cute.make_tiled_copy_tv(g2s_atom_b, tlAB_thr, tlAB_val)
-    # For C: thread layout (16, 8) along (M, N), val (1, 8). Each thread issues
-    # two 128-bit (= 4 fp32) cp.async ops to cover 8 fp32 along N.
+    # C copy is along (M, N). 128-bit cp.async = 16/sizeof(C_elt) along N
+    # per TV iteration.
+    elt_bytes_c = mC.element_type.width // 8
+    block_n_copy = min(64, N) // (16 // elt_bytes_c)
     tlC_thr = cute.make_layout(
         (NUM_THREADS // block_n_copy, block_n_copy),
         stride=(block_n_copy, 1),
     )
-    tlC_val = cute.make_layout((1, 8))
+    tlC_val = cute.make_layout((1, 16 // elt_bytes_c))
     g2s_atom_c = cute.make_copy_atom(g2s_op, mC.element_type, num_bits_per_copy=128)
     g2s_tiled_copy_c = cute.make_tiled_copy_tv(g2s_atom_c, tlC_thr, tlC_val)
 
@@ -262,9 +280,12 @@ def swizzling_gemm(
     s2r_atom_b = cute.make_copy_atom(ldm_op, mB.element_type)
     s2r_tiled_copy_a = cute.make_tiled_copy_A(s2r_atom_a, tm)
     s2r_tiled_copy_b = cute.make_tiled_copy_B(s2r_atom_b, tm)
-    # fp32 C uses universal copy for s2r (ldmatrix is 16-bit-only).
+    # C s2r: use ldmatrix if C is 16-bit, else universal copy (e.g. fp32).
     universal = cute.nvgpu.CopyUniversalOp()
-    s2r_atom_c = cute.make_copy_atom(universal, mC.element_type)
+    if cutlass.const_expr(mC.element_type.width == 16):
+        s2r_atom_c = cute.make_copy_atom(ldm_op, mC.element_type)
+    else:
+        s2r_atom_c = cute.make_copy_atom(universal, mC.element_type)
     s2r_tiled_copy_c = cute.make_tiled_copy_C(s2r_atom_c, tm)
 
     # ----- R2S + S2G copies for the smem-staged epilogue -----
@@ -303,6 +324,7 @@ def swizzling_gemm(
         sB_layout,
         sC_layout,
         sO_layout,
+        acc_dtype,
         out_dtype,
         is_gemm,
     ).launch(grid=(1, 1, 1), block=(NUM_THREADS, 1, 1), stream=stream)
@@ -360,6 +382,35 @@ def make_cute_tensor(t: torch.Tensor) -> cute.Tensor:
     )
 
 
+def _compile_pair(a_template, b_template, c_template, o_template, acc_dtype, out_dtype):
+    """Pre-compile (is_gemm=True, False) specializations for the given dtype combo."""
+    g_clear = cute.compile(
+        swizzling_gemm,
+        make_cute_tensor(a_template),
+        make_cute_tensor(b_template),
+        make_cute_tensor(c_template),
+        make_cute_tensor(o_template),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        acc_dtype,
+        out_dtype,
+        True,
+        options="--enable-tvm-ffi",
+    )
+    g_accum = cute.compile(
+        swizzling_gemm,
+        make_cute_tensor(a_template),
+        make_cute_tensor(b_template),
+        make_cute_tensor(c_template),
+        make_cute_tensor(o_template),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        acc_dtype,
+        out_dtype,
+        False,
+        options="--enable-tvm-ffi",
+    )
+    return g_clear, g_accum
+
+
 def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("This example requires a CUDA-capable GPU.")
@@ -367,56 +418,102 @@ def main() -> None:
     counters = {"succeed": 0, "failed": 0}
     torch.cuda.manual_seed_all(9527)
 
-    a = torch.empty(M, K, device="cuda", dtype=torch.bfloat16)
-    b = torch.empty(N, K, device="cuda", dtype=torch.bfloat16)
-    c = torch.empty(M, N, device="cuda", dtype=torch.float32)
-    o = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    # ----- Compile all three specs upfront. Template tensors are used only to
+    # tag dtype + leading-dim alignment for the compiled artifact. -----
 
-    print("Compiling CuTe DSL swizzling_gemm kernels ...")
-    gemm_clear = cute.compile(
-        swizzling_gemm,
-        make_cute_tensor(a),
-        make_cute_tensor(b),
-        make_cute_tensor(c),
-        make_cute_tensor(o),
-        make_fake_stream(use_tvm_ffi_env_stream=True),
-        cutlass.BFloat16,
-        True,
-        options="--enable-tvm-ffi",
+    print(" Compiling fp16 in / fp32 acc / fp16 out ... ".center(PRINT_LENGTH, "-"))
+    a_t = torch.empty(M, K, device="cuda", dtype=torch.float16)
+    b_t = torch.empty(N, K, device="cuda", dtype=torch.float16)
+    c_t = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    o_t = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    fp16f32_clear, fp16f32_accum = _compile_pair(
+        a_t,
+        b_t,
+        c_t,
+        o_t,
+        cutlass.Float32,
+        cutlass.Float16,
     )
-    gemm_accum = cute.compile(
-        swizzling_gemm,
-        make_cute_tensor(a),
-        make_cute_tensor(b),
-        make_cute_tensor(c),
-        make_cute_tensor(o),
-        make_fake_stream(use_tvm_ffi_env_stream=True),
+
+    print(" Compiling fp16 in / fp16 acc / fp16 out ... ".center(PRINT_LENGTH, "-"))
+    a_t = torch.empty(M, K, device="cuda", dtype=torch.float16)
+    b_t = torch.empty(N, K, device="cuda", dtype=torch.float16)
+    c_t = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    o_t = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    fp16_clear, fp16_accum = _compile_pair(
+        a_t,
+        b_t,
+        c_t,
+        o_t,
+        cutlass.Float16,
+        cutlass.Float16,
+    )
+
+    print(" Compiling bf16 in / fp32 acc / bf16 out ... ".center(PRINT_LENGTH, "-"))
+    a_t = torch.empty(M, K, device="cuda", dtype=torch.bfloat16)
+    b_t = torch.empty(N, K, device="cuda", dtype=torch.bfloat16)
+    c_t = torch.empty(M, N, device="cuda", dtype=torch.float32)
+    o_t = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    bf16_clear, bf16_accum = _compile_pair(
+        a_t,
+        b_t,
+        c_t,
+        o_t,
+        cutlass.Float32,
         cutlass.BFloat16,
-        False,
-        options="--enable-tvm-ffi",
     )
 
     print(f" M={M}, N={N}, K={K} ".center(PRINT_LENGTH, "-"))
 
+    # ----- Spec 1: fp16 = fp16 * fp16 + fp32 (validated) -----
+    print(" fp16 = fp32_acc(fp16 * fp16) + fp16 ".center(PRINT_LENGTH, "="))
+    torch.cuda.manual_seed_all(9527)
+    a = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    b = torch.randn(N, K, device="cuda", dtype=torch.float16)
+    c = torch.randn(M, N, device="cuda", dtype=torch.float32)
+
+    # Case 1: MM (fp16 = fp16 * fp16)
+    out = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    fp16f32_clear(a, b, c.clone().half(), out)
+    torch.cuda.synchronize()
+    # For fp16 input, torch.matmul uses fp32 as the accumulator precision
+    compare_matrix(out, torch.matmul(a.float(), b.T.float()).half(), counters)
+
+    # Case 2: MMA (fp16 = fp16 * fp16 + fp16)
+    out = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    fp16f32_accum(a, b, c.clone().half(), out)
+    torch.cuda.synchronize()
+    compare_matrix(out, torch.addmm(c, a.float(), b.T.float()).half(), counters)
+
+    # ----- Spec 2: fp16 = fp16 * fp16 + fp16 (exercise only, not validated) -----
+    # Matches swizzling.py: the fp16-accumulator variant is launched but not
+    # compared — fp16 accumulation drops too many bits to match torch's
+    # fp32-accumulated reference.
+    print(" fp16 = fp16 * fp16 + fp16 (exercise only) ".center(PRINT_LENGTH, "="))
+    out = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    fp16_clear(a, b, c.clone().half(), out)
+    out = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    fp16_accum(a, b, c.clone().half(), out)
+    torch.cuda.synchronize()
+
+    # ----- Spec 3: bf16 = bf16 * bf16 + fp32 (validated) -----
+    print(" bf16 = fp32_acc(bf16 * bf16) + fp32 ".center(PRINT_LENGTH, "="))
+    torch.cuda.manual_seed_all(9527)
     a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
     c = torch.randn(M, N, device="cuda", dtype=torch.float32)
 
-    c_out = torch.empty(M, N, device="cuda", dtype=torch.float32)
-    out_buf = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-    gemm_clear(a, b, c_out, out_buf)
+    # Case 1: MM (bf16 = bf16 * bf16)
+    out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    bf16_clear(a, b, c.clone(), out)
     torch.cuda.synchronize()
-    compare_matrix(out_buf, torch.matmul(a.float(), b.T.float()).bfloat16(), counters)
+    compare_matrix(out, torch.matmul(a.float(), b.T.float()).bfloat16(), counters)
 
-    c_inout = c.clone()
-    out_buf = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
-    gemm_accum(a, b, c_inout, out_buf)
+    # Case 2: MMA (bf16 = bf16 * bf16 + fp32)
+    out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    bf16_accum(a, b, c.clone(), out)
     torch.cuda.synchronize()
-    compare_matrix(
-        out_buf,
-        torch.addmm(c, a.float(), b.T.float()).bfloat16(),
-        counters,
-    )
+    compare_matrix(out, torch.addmm(c, a.float(), b.T.float()).bfloat16(), counters)
 
     print(f" Summary: {counters['succeed']} Succeed, {counters['failed']} Failed ".center(PRINT_LENGTH, "-"))
 
