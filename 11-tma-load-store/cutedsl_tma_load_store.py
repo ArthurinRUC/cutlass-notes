@@ -50,6 +50,7 @@ import cutlass.utils.hopper_helpers as sm90_utils
 import torch
 from cuda.bindings.driver import CUstream
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
+from cutlass.utils.layout import LayoutEnum
 
 
 # Block tile (matches the C++ KernelSpec defaults).
@@ -374,21 +375,21 @@ def tma_load_store(
         permutation_mnk=MMA_TILE_MNK,
     )
 
-    # ----- Swizzled smem layouts (GMMA K_SW128 atom) -----
+    # ----- Swizzled smem layouts selected from the major-mode extent -----
     a_atom = sm90_utils.make_smem_layout_atom(
-        cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
+        sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, mA.element_type, BLK_K),
         mA.element_type,
     )
     b_atom = sm90_utils.make_smem_layout_atom(
-        cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
+        sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, mB.element_type, BLK_K),
         mB.element_type,
     )
     c_atom = sm90_utils.make_smem_layout_atom(
-        cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
+        sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, mC.element_type, BLK_N),
         mC.element_type,
     )
     d_atom = sm90_utils.make_smem_layout_atom(
-        cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
+        sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, out_dtype, BLK_N),
         out_dtype,
     )
     # A/B carry a singleton STAGE axis so tma_partition has a matching

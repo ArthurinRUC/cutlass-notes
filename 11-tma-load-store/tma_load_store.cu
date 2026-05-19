@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/barrier.h>
+#include <cutlass/gemm/collective/builders/sm90_common.inl>
 
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
@@ -319,29 +320,68 @@ struct KernelSpec {
   using TiledCopyC_S2R = decltype(make_tiled_copy_C(CopyC_S2R_atom{}, TiledMMA{}));
   using TiledCopyD_R2S = decltype(make_tiled_copy_C(CopyD_R2S_atom{}, TiledMMA{}));
 
-  // Note: 如果 SMEM 使用了超过 8bit 的 pointer，则必须要使用 GMMA::Layout_K_SW128_Atom 构建 SMEM layout，
-  // 或者在先前的构造方法的 composition 中显式增加 offset 参数，否则在有 swizzle 的情况下，计算结果<可能>会不正确。
-  // 那有聪明的同学要问了，什么情况还会正确呢？有一种情况就是 Sw<3,3,3> 且 SMEM pointer 指向 16b 数据。
-  // 如果仅使用 uint8_t/char 类型的 SMEM pointer，则是否传入 offset 参数不影响计算结果。
-  // Before Layout A: Sw<3,4,3> o _0 o ((_8,_16),(_64,_1)):((_64,_512),(_1,_0))
-  // After  Layout A: Sw<3,4,3> o smem_ptr[16b](unset) o ((_8,_16),(_64,_1)):((_64,_512),(_1,_0))
-  using SmemLayoutA = decltype(tile_to_shape(
-      GMMA::Layout_K_SW128_Atom<ComputeTypeA>{}, make_shape(Int<kBlockM>{}, Int<kBlockK>{}), Step<_1, _2>{}));
-  // Also we can use:
-  // using SmemLayoutAtomA = decltype(composition(
-  //                                     Swizzle<3, 4, 3>{},
-  //                                     smem_ptr_flag_bits<sizeof_bits<ComputeTypeA>::value>{},
-  //                                     make_layout(make_shape(Int<8>{}, Int<cute::min(64, kBlockK)>{}),
-  //                                                 make_stride(Int<cute::min(64, kBlockK)>{}, Int<1>{}))));
-  // using SmemLayoutA = decltype(tile_to_shape(SmemLayoutAtomA{},
-  //                                            make_shape(Int<kBlockM>{}, Int<kBlockK>{}),
-  //                                            Step<_1,_2>{}));
-  using SmemLayoutB = decltype(tile_to_shape(
-      GMMA::Layout_K_SW128_Atom<ComputeTypeB>{}, make_shape(Int<kBlockN>{}, Int<kBlockK>{}), Step<_1, _2>{}));
-  using SmemLayoutC = decltype(tile_to_shape(
-      GMMA::Layout_K_SW128_Atom<ComputeTypeC>{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{}), Step<_1, _2>{}));
-  using SmemLayoutD = decltype(tile_to_shape(
-      GMMA::Layout_K_SW128_Atom<OutType>{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{}), Step<_1, _2>{}));
+  // CUTLASS's SM90 selector chooses the widest K-major SMEM atom whose
+  // contiguous byte span fits the inner tile mode. For example, when
+  // ComputeTypeA is half_t and kBlockK is 64, the inner mode is
+  // 64 * 16 bits = 1024 bits = 128B, so the selector resolves to the same atom
+  // as GMMA::Layout_K_SW128_Atom<ComputeTypeA>. If the inner mode were only
+  // 32 half elements, the same selector would fall back to the 64B atom.
+  //
+  // The shape passed to tile_to_shape is still expressed in element
+  // coordinates. If make_layout(coord) returns element_offset, then the byte
+  // displacement seen by the SMEM pointer is:
+  //
+  //   byte_offset = element_offset * sizeof(Element)
+  //
+  // The selected GMMA atom carries smem_ptr_flag_bits<sizeof_bits<Element>>,
+  // which is what makes CuTe apply the hardware swizzle after converting the
+  // element offset into a byte-addressed SMEM pointer.
+  //
+  // When the selector resolves to the 128B atom, the canonical CUTLASS form is
+  // byte-address based:
+  //
+  //   Swizzle<3,4,3> o smem_ptr_flag_bits<sizeof_bits<Element>> o element layout
+  //
+  // For a concrete 16-bit A tile, that canonical atom is equivalent to:
+  //
+  //   using SmemLayoutAtomA128 = GMMA::Layout_K_SW128_Atom<ComputeTypeA>;
+  //   using SmemLayoutA128 = decltype(tile_to_shape(
+  //       SmemLayoutAtomA128{}, make_shape(Int<kBlockM>{}, Int<kBlockK>{}), Step<_1, _2>{}));
+  //
+  // A 16-bit-only derivation that swizzles element offsets can instead be
+  // written as Swizzle<3,3,3> because byte_offset = element_offset * 2 shifts
+  // the relevant bit fields left by one:
+  //
+  //   using ElementOffsetAtomA16b = decltype(composition(
+  //       Swizzle<3, 3, 3>{},
+  //       make_layout(make_shape(Int<8>{}, Int<cute::min(64, kBlockK)>{}),
+  //                   make_stride(Int<cute::min(64, kBlockK)>{}, Int<1>{}))));
+  //
+  // That element-offset spelling is only a special-case explanation for
+  // 16-bit elements. The actual GMMA/TMA layout contract is byte-addressed, so
+  // the selector returns CUTLASS's canonical Swizzle<3,4,3> atom for 128B
+  // swizzling rather than a Swizzle<3,3,3> atom.
+  using SmemLayoutAtomA =
+      decltype(cutlass::gemm::collective::detail::
+                   ss_smem_selector<GMMA::Major::K, ComputeTypeA, Shape<Int<kBlockM>>, Shape<Int<kBlockK>>>());
+  using SmemLayoutAtomB =
+      decltype(cutlass::gemm::collective::detail::
+                   ss_smem_selector<GMMA::Major::K, ComputeTypeB, Shape<Int<kBlockN>>, Shape<Int<kBlockK>>>());
+  using SmemLayoutAtomC =
+      decltype(cutlass::gemm::collective::detail::
+                   ss_smem_selector<GMMA::Major::K, ComputeTypeC, Shape<Int<kBlockM>>, Shape<Int<kBlockN>>>());
+  using SmemLayoutAtomD =
+      decltype(cutlass::gemm::collective::detail::
+                   ss_smem_selector<GMMA::Major::K, OutType, Shape<Int<kBlockM>>, Shape<Int<kBlockN>>>());
+
+  using SmemLayoutA =
+      decltype(tile_to_shape(SmemLayoutAtomA{}, make_shape(Int<kBlockM>{}, Int<kBlockK>{}), Step<_1, _2>{}));
+  using SmemLayoutB =
+      decltype(tile_to_shape(SmemLayoutAtomB{}, make_shape(Int<kBlockN>{}, Int<kBlockK>{}), Step<_1, _2>{}));
+  using SmemLayoutC =
+      decltype(tile_to_shape(SmemLayoutAtomC{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{}), Step<_1, _2>{}));
+  using SmemLayoutD =
+      decltype(tile_to_shape(SmemLayoutAtomD{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{}), Step<_1, _2>{}));
 
   static constexpr int kShmSizeA = cosize_v<SmemLayoutA> * sizeof(ComputeTypeA);
   static constexpr int kShmSizeB = cosize_v<SmemLayoutB> * sizeof(ComputeTypeB);
