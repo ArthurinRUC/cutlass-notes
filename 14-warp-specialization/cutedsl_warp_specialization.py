@@ -36,8 +36,8 @@ Three dtype specs match the C++ harness:
 
 **Shape sweep**: The C++ harness sweeps 8x8x8 = 512 shapes per dtype.
 This DSL port runs the full sweep; sub-tile residues are handled by
-TMA OOB zero-fill (GMMA K_SW128 swizzling means K < BLK_K=64 and
-N < BLK_N=256 exercise that path). See ``EXPS`` below.
+TMA OOB zero-fill. K < BLK_K=64 and N < BLK_N=256 exercise that path.
+See ``EXPS`` below.
 """
 
 import cutlass
@@ -51,6 +51,7 @@ from cutlass.cute.nvgpu.warpgroup import (
     OperandSource,
 )
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
+from cutlass.utils.layout import LayoutEnum
 
 
 # Block tile (matches the C++ KernelSpec defaults in warp_specialization.cu).
@@ -448,21 +449,21 @@ def warp_specialization_host(
     )
     tm = cute.make_tiled_mma(cute.make_mma_atom(op), ATOM_LAYOUT_MNK)
 
-    # ----- Swizzled smem layouts (GMMA K_SW128 atom) -----
+    # ----- Swizzled smem layouts selected from the major-mode extent -----
     a_atom = sm90_utils.make_smem_layout_atom(
-        cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
+        sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, mA.element_type, BLK_K),
         mA.element_type,
     )
     b_atom = sm90_utils.make_smem_layout_atom(
-        cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
+        sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, mB.element_type, BLK_K),
         mB.element_type,
     )
     c_atom = sm90_utils.make_smem_layout_atom(
-        cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
+        sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, mC.element_type, BLK_N),
         mC.element_type,
     )
     d_atom = sm90_utils.make_smem_layout_atom(
-        cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
+        sm90_utils.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, out_dtype, BLK_N),
         out_dtype,
     )
     sA_layout_staged = cute.tile_to_shape(

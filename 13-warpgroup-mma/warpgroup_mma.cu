@@ -2,6 +2,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/cluster_launch.hpp>
+#include <cutlass/gemm/collective/builders/sm90_common.inl>
 
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
@@ -434,14 +435,25 @@ struct KernelSpec {
   using TiledCopyC_S2R = decltype(make_tiled_copy_C(CopyC_S2R_atom{}, TiledMMA{}));
   using TiledCopyD_R2S = decltype(make_tiled_copy_C(CopyD_R2S_atom{}, TiledMMA{}));
 
-  using SmemLayoutA = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<ComputeTypeA>{},
-                                             make_shape(Int<kBlockM>{}, Int<kBlockK>{}, Int<kStages>{})));
-  using SmemLayoutB = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<ComputeTypeB>{},
-                                             make_shape(Int<kBlockN>{}, Int<kBlockK>{}, Int<kStages>{})));
-  using SmemLayoutC =
-      decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<ComputeTypeC>{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
-  using SmemLayoutD =
-      decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<OutType>{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
+  using SmemLayoutAtomA =
+      decltype(cutlass::gemm::collective::detail::
+                   ss_smem_selector<GMMA::Major::K, ComputeTypeA, Shape<Int<kBlockM>>, Shape<Int<kBlockK>>>());
+  using SmemLayoutAtomB =
+      decltype(cutlass::gemm::collective::detail::
+                   ss_smem_selector<GMMA::Major::K, ComputeTypeB, Shape<Int<kBlockN>>, Shape<Int<kBlockK>>>());
+  using SmemLayoutAtomC =
+      decltype(cutlass::gemm::collective::detail::
+                   ss_smem_selector<GMMA::Major::K, ComputeTypeC, Shape<Int<kBlockM>>, Shape<Int<kBlockN>>>());
+  using SmemLayoutAtomD =
+      decltype(cutlass::gemm::collective::detail::
+                   ss_smem_selector<GMMA::Major::K, OutType, Shape<Int<kBlockM>>, Shape<Int<kBlockN>>>());
+
+  using SmemLayoutA =
+      decltype(tile_to_shape(SmemLayoutAtomA{}, make_shape(Int<kBlockM>{}, Int<kBlockK>{}, Int<kStages>{})));
+  using SmemLayoutB =
+      decltype(tile_to_shape(SmemLayoutAtomB{}, make_shape(Int<kBlockN>{}, Int<kBlockK>{}, Int<kStages>{})));
+  using SmemLayoutC = decltype(tile_to_shape(SmemLayoutAtomC{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
+  using SmemLayoutD = decltype(tile_to_shape(SmemLayoutAtomD{}, make_shape(Int<kBlockM>{}, Int<kBlockN>{})));
 
   static constexpr int kShmSizeA = cosize_v<SmemLayoutA> * sizeof(ComputeTypeA);
   static constexpr int kShmSizeB = cosize_v<SmemLayoutB> * sizeof(ComputeTypeB);
