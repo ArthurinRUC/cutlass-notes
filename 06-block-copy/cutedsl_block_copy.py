@@ -210,28 +210,36 @@ def block_copy_gemm(
     sO_layout = cute.tile_to_shape(atom_O, (M, N, 1), order=(0, 1, 2))
 
     # ----- G2S (gmem -> smem) tiled copies using cp.async -----
-    # 128-bit-per-thread cp.async: 8 bf16 = 4 fp32 = 16 bytes.
+    # 128-bit-per-thread cp.async: 16 bytes / sizeof(elt) elements per copy.
     g2s_op = cute.nvgpu.cpasync.CopyG2SOp(
         cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL,
     )
 
-    # For A (M=128, K=64) and B (N=128, K=64), each row is 64 bf16 = 128 B,
-    # so a thread's 16-byte cp.async loads 8 bf16 along K. With 256 threads,
-    # we lay them out as 32 (M rows) x 8 (K chunks) per iteration.
-    tlA_thr = cute.make_layout((32, 8), stride=(8, 1))
-    tlA_val = cute.make_layout((1, 8))
+    # AB copy is along (M/N, K). Threads packed contiguously along K, each
+    # thread emits 16 / sizeof(elt) elements in a 128-bit cp.async. Mirrors
+    # block_copy.cu's TiledCopyA_G2S / TiledCopyB_G2S derived from
+    # kBlockK_Copy = min(64, kBlockK) / (16 / sizeof(elt)).
+    elt_bytes_ab = mA.element_type.width // 8
+    block_k_copy = min(64, K) // (16 // elt_bytes_ab)
+    tlAB_thr = cute.make_layout(
+        (NUM_THREADS // block_k_copy, block_k_copy),
+        stride=(block_k_copy, 1),
+    )
+    tlAB_val = cute.make_layout((1, 16 // elt_bytes_ab))
     g2s_atom_a = cute.make_copy_atom(g2s_op, mA.element_type, num_bits_per_copy=128)
-    g2s_tiled_copy_a = cute.make_tiled_copy_tv(g2s_atom_a, tlA_thr, tlA_val)
-
-    tlB_thr = cute.make_layout((32, 8), stride=(8, 1))
-    tlB_val = cute.make_layout((1, 8))
     g2s_atom_b = cute.make_copy_atom(g2s_op, mB.element_type, num_bits_per_copy=128)
-    g2s_tiled_copy_b = cute.make_tiled_copy_tv(g2s_atom_b, tlB_thr, tlB_val)
+    g2s_tiled_copy_a = cute.make_tiled_copy_tv(g2s_atom_a, tlAB_thr, tlAB_val)
+    g2s_tiled_copy_b = cute.make_tiled_copy_tv(g2s_atom_b, tlAB_thr, tlAB_val)
 
-    # For C (M=128, N=128) fp32: each row is 128 fp32 = 512 B, so a
-    # thread's 16-byte cp.async loads 4 fp32 along N. Use 32 (M) x 8 (N).
-    tlC_thr = cute.make_layout((32, 8), stride=(8, 1))
-    tlC_val = cute.make_layout((1, 4))
+    # C copy is along (M, N). Mirrors block_copy.cu's TiledCopyC_G2S derived
+    # from kBlockN_Copy = min(64, kBlockN) / (16 / sizeof(elt)).
+    elt_bytes_c = mC.element_type.width // 8
+    block_n_copy = min(64, N) // (16 // elt_bytes_c)
+    tlC_thr = cute.make_layout(
+        (NUM_THREADS // block_n_copy, block_n_copy),
+        stride=(block_n_copy, 1),
+    )
+    tlC_val = cute.make_layout((1, 16 // elt_bytes_c))
     g2s_atom_c = cute.make_copy_atom(g2s_op, mC.element_type, num_bits_per_copy=128)
     g2s_tiled_copy_c = cute.make_tiled_copy_tv(g2s_atom_c, tlC_thr, tlC_val)
 

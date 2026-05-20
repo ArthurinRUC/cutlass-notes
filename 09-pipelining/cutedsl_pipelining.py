@@ -59,10 +59,10 @@ NUM_STAGES = 3
 
 MMA_INST_MNK = (16, 8, 16)
 ATOM_LAYOUT_MNK = (2, 4, 1)
-VAL_EXPAND_MNK = (1, 2, 2)
+VAL_EXPAND_MNK = (1, 1, 2)
 MMA_TILE_MNK = (
     ATOM_LAYOUT_MNK[0] * VAL_EXPAND_MNK[0] * MMA_INST_MNK[0],  # 32
-    ATOM_LAYOUT_MNK[1] * VAL_EXPAND_MNK[1] * MMA_INST_MNK[1],  # 64
+    ATOM_LAYOUT_MNK[1] * VAL_EXPAND_MNK[1] * MMA_INST_MNK[1],  # 32
     ATOM_LAYOUT_MNK[2] * VAL_EXPAND_MNK[2] * MMA_INST_MNK[2],  # 32
 )
 NUM_THREADS = (
@@ -92,7 +92,7 @@ def pipelining_kernel(
     s2g_tiled_copy_o: cute.TiledCopy,
     sA_layout: cute.ComposedLayout,
     sB_layout: cute.ComposedLayout,
-    sC_layout: cute.Layout,
+    sC_layout: cute.ComposedLayout,
     sO_layout: cute.ComposedLayout,
     out_dtype: cutlass.Constexpr,
     is_gemm: cutlass.Constexpr[bool],
@@ -529,7 +529,14 @@ def pipelining_gemm(
         (BLK_N, BLK_K, NUM_STAGES),
         order=(0, 1, 2),
     )
-    sC_layout = cute.make_layout((BLK_M, BLK_N), stride=(BLK_N, 1))
+    # sC mirrors pipelining.cu's SmemLayoutC: Swizzle<3,3,3> o (8 x min(64, BLK_N)).
+    inner_C = min(64, BLK_N)
+    atom_C = cute.make_composed_layout(
+        swz,
+        0,
+        cute.make_layout((8, inner_C), stride=(inner_C, 1)),
+    )
+    sC_layout = cute.tile_to_shape(atom_C, (BLK_M, BLK_N), order=(0, 1))
     # sO mirrors pipelining.cu's SmemLayoutO: Swizzle<3,3,3> o (8 x min(64, BLK_N)).
     # Single-stage — the epilogue runs after the mainloop finishes draining,
     # so no PIPE mode is needed.
@@ -577,9 +584,18 @@ def pipelining_gemm(
     s2r_tiled_copy_c = cute.make_tiled_copy_C(s2r_atom_c, tm)
 
     # ----- R2S + S2G copies for the smem-staged epilogue -----
-    # R2S: MMA-derived TiledCopy so each thread's accumulator fragment
-    # lands at its natural smem position under the swizzled sO layout.
-    r2s_atom_o = cute.make_copy_atom(universal, mO.element_type)
+    # R2S: MMA-derived TiledCopy so each thread's accumulator fragment lands
+    # at its natural smem position under the swizzled sO layout. Pick the op
+    # the same way pipelining.cu does: SM90+ with a 16-bit output uses
+    # ``stmatrix`` (x2 because the C/O fragment has no K val-expand and so
+    # owns 2 32-bit packets per thread); otherwise fall back to a universal
+    # STS lowering.
+    sm_major, _ = torch.cuda.get_device_capability()
+    if cutlass.const_expr(sm_major >= 9 and mO.element_type.width == 16):
+        stm_op = cute.nvgpu.warp.StMatrix8x8x16bOp(False, 2)
+        r2s_atom_o = cute.make_copy_atom(stm_op, mO.element_type)
+    else:
+        r2s_atom_o = cute.make_copy_atom(universal, mO.element_type)
     r2s_tiled_copy_o = cute.make_tiled_copy_C(r2s_atom_o, tm)
 
     # S2G: explicit TV layout — threads packed contiguously along N,
