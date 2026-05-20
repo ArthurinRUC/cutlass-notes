@@ -47,14 +47,14 @@ N = 128
 K = 64
 
 MMA_INST_MNK = (16, 8, 16)
-ATOM_LAYOUT_MNK = (2, 2, 1)
-VAL_EXPAND_MNK = (1, 2, 2)
+ATOM_LAYOUT_MNK = (2, 4, 1)
+VAL_EXPAND_MNK = (1, 1, 2)
 MMA_TILE_MNK = (
     ATOM_LAYOUT_MNK[0] * VAL_EXPAND_MNK[0] * MMA_INST_MNK[0],  # 32
     ATOM_LAYOUT_MNK[1] * VAL_EXPAND_MNK[1] * MMA_INST_MNK[1],  # 32
     ATOM_LAYOUT_MNK[2] * VAL_EXPAND_MNK[2] * MMA_INST_MNK[2],  # 32
 )
-NUM_THREADS = ATOM_LAYOUT_MNK[0] * ATOM_LAYOUT_MNK[1] * ATOM_LAYOUT_MNK[2] * 32  # 128
+NUM_THREADS = ATOM_LAYOUT_MNK[0] * ATOM_LAYOUT_MNK[1] * ATOM_LAYOUT_MNK[2] * 32  # 256
 
 
 # -----------------------------------------------------------------------------
@@ -79,7 +79,7 @@ def swizzling_kernel(
     s2g_tiled_copy_o: cute.TiledCopy,
     sA_layout: cute.ComposedLayout,
     sB_layout: cute.ComposedLayout,
-    sC_layout: cute.Layout,
+    sC_layout: cute.ComposedLayout,
     sO_layout: cute.ComposedLayout,
     acc_dtype: cutlass.Constexpr,
     out_dtype: cutlass.Constexpr,
@@ -103,22 +103,20 @@ def swizzling_kernel(
 
     # ----- Phase 1: gmem -> smem via cp.async -----
     thr_g2s_a = g2s_tiled_copy_a.get_slice(tid)
-    cute.copy(
-        g2s_tiled_copy_a,
-        thr_g2s_a.partition_S(gA),
-        thr_g2s_a.partition_D(sA),
-    )
+    tAgA_g2s = thr_g2s_a.partition_S(gA)
+    tAsA_g2s = thr_g2s_a.partition_D(sA)
+    cute.copy(g2s_tiled_copy_a, tAgA_g2s, tAsA_g2s)
 
     thr_g2s_b = g2s_tiled_copy_b.get_slice(tid)
-    cute.copy(
-        g2s_tiled_copy_b,
-        thr_g2s_b.partition_S(gB),
-        thr_g2s_b.partition_D(sB),
-    )
+    tBgB_g2s = thr_g2s_b.partition_S(gB)
+    tBsB_g2s = thr_g2s_b.partition_D(sB)
+    cute.copy(g2s_tiled_copy_b, tBgB_g2s, tBsB_g2s)
 
     if cutlass.const_expr(not is_gemm):
         thr_g2s_c = g2s_tiled_copy_c.get_slice(tid)
-        cute.copy(g2s_tiled_copy_c, thr_g2s_c.partition_S(gC), thr_g2s_c.partition_D(sC))
+        tCgC_g2s = thr_g2s_c.partition_S(gC)
+        tCsC_g2s = thr_g2s_c.partition_D(sC)
+        cute.copy(g2s_tiled_copy_c, tCgC_g2s, tCsC_g2s)
 
     cute.arch.cp_async_commit_group()
     cute.arch.cp_async_wait_group(0)
@@ -132,18 +130,14 @@ def swizzling_kernel(
 
     # ----- Phase 2: smem -> rmem via ldmatrix-backed TiledCopies -----
     thr_s2r_a = s2r_tiled_copy_a.get_slice(tid)
-    cute.copy(
-        s2r_tiled_copy_a,
-        thr_s2r_a.partition_S(sA),
-        thr_s2r_a.retile(tCrA),
-    )
+    tAsA_s2r = thr_s2r_a.partition_S(sA)
+    tArA_s2r = thr_s2r_a.retile(tCrA)
+    cute.copy(s2r_tiled_copy_a, tAsA_s2r, tArA_s2r)
 
     thr_s2r_b = s2r_tiled_copy_b.get_slice(tid)
-    cute.copy(
-        s2r_tiled_copy_b,
-        thr_s2r_b.partition_S(sB),
-        thr_s2r_b.retile(tCrB),
-    )
+    tBsB_s2r = thr_s2r_b.partition_S(sB)
+    tBrB_s2r = thr_s2r_b.retile(tCrB)
+    cute.copy(s2r_tiled_copy_b, tBsB_s2r, tBrB_s2r)
 
     if cutlass.const_expr(is_gemm):
         tCrC.fill(0.0)
@@ -156,11 +150,9 @@ def swizzling_kernel(
         # step. When acc_dtype == mC.element_type this is a no-op cast.
         thr_s2r_c = s2r_tiled_copy_c.get_slice(tid)
         tCrC_pre = cute.make_fragment_like(tCrC, mC.element_type)
-        cute.copy(
-            s2r_tiled_copy_c,
-            thr_s2r_c.partition_S(sC),
-            thr_s2r_c.retile(tCrC_pre),
-        )
+        tCsC_s2r = thr_s2r_c.partition_S(sC)
+        tCrC_s2r = thr_s2r_c.retile(tCrC_pre)
+        cute.copy(s2r_tiled_copy_c, tCsC_s2r, tCrC_s2r)
         tCrC.store(tCrC_pre.load().to(acc_dtype))
 
     # ----- Phase 3: compute -----
@@ -226,9 +218,14 @@ def swizzling_gemm(
     )
     sA_layout = cute.tile_to_shape(atom_AB, (M, K), order=(0, 1))
     sB_layout = cute.tile_to_shape(atom_AB, (N, K), order=(0, 1))
-    # The C preload buffer doesn't need swizzling for our flow; use a plain
-    # row-major layout.
-    sC_layout = cute.make_layout((M, N), stride=(N, 1))
+    # sC mirrors swizzling.cu's SmemLayoutC: Swizzle<3,3,3> o (8 x min(64, N)).
+    inner_C = min(64, N)
+    atom_C = cute.make_composed_layout(
+        swz,
+        0,
+        cute.make_layout((8, inner_C), stride=(inner_C, 1)),
+    )
+    sC_layout = cute.tile_to_shape(atom_C, (M, N), order=(0, 1))
     # sO mirrors swizzling.cu's SmemLayoutO: Swizzle<3,3,3> o (8 x min(64, BLK_N)).
     inner_O = min(64, N)
     atom_O = cute.make_composed_layout(
@@ -268,23 +265,37 @@ def swizzling_gemm(
     g2s_tiled_copy_c = cute.make_tiled_copy_tv(g2s_atom_c, tlC_thr, tlC_val)
 
     # ----- S2R tiled copies (ldmatrix for the 16-bit operands) -----
-    ldm_op = cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4)
-    s2r_atom_a = cute.make_copy_atom(ldm_op, mA.element_type)
-    s2r_atom_b = cute.make_copy_atom(ldm_op, mB.element_type)
+    # A/B own 4 32-bit packets per thread (VAL_EXPAND_K=2), so the x4
+    # ldmatrix variant fits exactly. C has no K val-expand, so each thread
+    # only owns 2 32-bit packets — use the x2 ldmatrix variant for the C
+    # s2r, mirroring swizzling.cu's Copy_S2R_op_C = SM75_U32x2_LDSM_N.
+    ldm_op_ab = cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4)
+    ldm_op_c = cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2)
+    s2r_atom_a = cute.make_copy_atom(ldm_op_ab, mA.element_type)
+    s2r_atom_b = cute.make_copy_atom(ldm_op_ab, mB.element_type)
     s2r_tiled_copy_a = cute.make_tiled_copy_A(s2r_atom_a, tm)
     s2r_tiled_copy_b = cute.make_tiled_copy_B(s2r_atom_b, tm)
     # C s2r: use ldmatrix if C is 16-bit, else universal copy (e.g. fp32).
     universal = cute.nvgpu.CopyUniversalOp()
     if cutlass.const_expr(mC.element_type.width == 16):
-        s2r_atom_c = cute.make_copy_atom(ldm_op, mC.element_type)
+        s2r_atom_c = cute.make_copy_atom(ldm_op_c, mC.element_type)
     else:
         s2r_atom_c = cute.make_copy_atom(universal, mC.element_type)
     s2r_tiled_copy_c = cute.make_tiled_copy_C(s2r_atom_c, tm)
 
     # ----- R2S + S2G copies for the smem-staged epilogue -----
-    # R2S: MMA-derived TiledCopy so each thread's accumulator fragment
-    # lands at its natural smem position under the swizzled sO layout.
-    r2s_atom_o = cute.make_copy_atom(universal, mO.element_type)
+    # R2S: MMA-derived TiledCopy so each thread's accumulator fragment lands
+    # at its natural smem position under the swizzled sO layout. Pick the op
+    # the same way swizzling.cu does: SM90+ with a 16-bit output uses
+    # ``stmatrix`` (x2 because the C/O fragment has no K val-expand and so
+    # owns 2 32-bit packets per thread); otherwise fall back to a universal
+    # STS lowering.
+    sm_major, _ = torch.cuda.get_device_capability()
+    if cutlass.const_expr(sm_major >= 9 and mO.element_type.width == 16):
+        stm_op = cute.nvgpu.warp.StMatrix8x8x16bOp(False, 2)
+        r2s_atom_o = cute.make_copy_atom(stm_op, mO.element_type)
+    else:
+        r2s_atom_o = cute.make_copy_atom(universal, mO.element_type)
     r2s_tiled_copy_o = cute.make_tiled_copy_C(r2s_atom_o, tm)
 
     # S2G: explicit TV layout — threads packed contiguously along N,

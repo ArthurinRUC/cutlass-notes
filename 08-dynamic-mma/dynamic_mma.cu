@@ -339,7 +339,7 @@ struct KernelSpec {
   static constexpr int kMmaThrExpandK = 1;
 
   static constexpr int kMmaValExpandM = 1;
-  static constexpr int kMmaValExpandN = 2;
+  static constexpr int kMmaValExpandN = 1;
   static constexpr int kMmaValExpandK = 2;
 
   static constexpr int kMmaTileM = kMmaThrExpandM * kMmaValExpandM * get<0>(MMA_shape{});
@@ -362,7 +362,11 @@ struct KernelSpec {
   // Note: ldmatrix only support 16-bit data type (or below)
   using Copy_S2R_op_A = std::conditional_t<sizeof(ComputeTypeA) == 2, SM75_U32x4_LDSM_N, AutoVectorizingCopy>;
   using Copy_S2R_op_B = std::conditional_t<sizeof(ComputeTypeB) == 2, SM75_U32x4_LDSM_N, AutoVectorizingCopy>;
-  using Copy_S2R_op_C = std::conditional_t<sizeof(ComputeTypeC) == 2, SM75_U32x4_LDSM_N, AutoVectorizingCopy>;
+  // The C / O accumulator fragment has no K val-expand, so each thread only
+  // owns half the 32-bit packets of an A/B fragment. Use the x2 LDSM/STSM
+  // variant for C-side copies; A/B keep x4 because VAL_EXPAND_K=2 gives them
+  // enough vals/thread.
+  using Copy_S2R_op_C = std::conditional_t<sizeof(ComputeTypeC) == 2, SM75_U32x2_LDSM_N, AutoVectorizingCopy>;
 
   using CopyA_G2S_atom = Copy_Atom<Copy_G2S_op, ComputeTypeA>;
   using CopyB_G2S_atom = Copy_Atom<Copy_G2S_op, ComputeTypeB>;
@@ -373,7 +377,9 @@ struct KernelSpec {
   using CopyC_S2R_atom = Copy_Atom<Copy_S2R_op_C, ComputeTypeC>;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  using Copy_R2S_op = SM90_U32x4_STSM_N;
+  // R2S writes a C-shaped fragment, so match the C-side x2 variant chosen
+  // above. SM90_U32x4_STSM_N would static_assert on too-few vals/thread.
+  using Copy_R2S_op = SM90_U32x2_STSM_N;
 #else
   using Copy_R2S_op = AutoVectorizingCopy;
 #endif
