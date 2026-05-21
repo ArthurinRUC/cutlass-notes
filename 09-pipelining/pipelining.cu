@@ -153,27 +153,41 @@ __global__ __launch_bounds__(Spec::kThreadNum) void pipelining(void *__restrict_
   // Prefetch
   //
 
+  // Interior fast path: block fully inside both M and N tiles and K is
+  // tile-aligned. Used for stage 0 only (later prologue stages + mainloop
+  // keep their existing predicated path with overshoot guards).
+  const bool is_interior = (m_max_coord >= kBlockM) && (n_max_coord >= kBlockN) && (k_residue == 0);
+
   if constexpr (!IsGemm) {
-    clear(tCsC_g2s);
-    copy_if(g2s_tiled_copy_c, tCpC_g2s, tCgC_g2s, tCsC_g2s);
+    if (is_interior) {
+      copy(g2s_tiled_copy_c, tCgC_g2s, tCsC_g2s);
+    } else {
+      clear(tCsC_g2s);
+      copy_if(g2s_tiled_copy_c, tCpC_g2s, tCgC_g2s, tCsC_g2s);
+    }
   }
 
   int NTilesK = ceil_div(K, kBlockK);
 
-  clear(tAsA_g2s);
-  clear(tBsB_g2s);
+  if (is_interior) {
+    copy(g2s_tiled_copy_a, tAgA_g2s(_, _, _, 0), tAsA_g2s(_, _, _, 0));
+    copy(g2s_tiled_copy_b, tBgB_g2s(_, _, _, 0), tBsB_g2s(_, _, _, 0));
+  } else {
+    clear(tAsA_g2s);
+    clear(tBsB_g2s);
 
 #pragma unroll
-  for (int k = 0; k < size<2>(tAsA_g2s); ++k) {
-    if (get<1>(tAcA_g2s(0, 0, k)) >= -k_residue) { // blk_k coord < residue_k (gA shifted)
-      copy_if(g2s_tiled_copy_a, tApA_g2s(_, k), tAgA_g2s(_, _, k, 0), tAsA_g2s(_, _, k, 0));
+    for (int k = 0; k < size<2>(tAsA_g2s); ++k) {
+      if (get<1>(tAcA_g2s(0, 0, k)) >= -k_residue) {
+        copy_if(g2s_tiled_copy_a, tApA_g2s(_, k), tAgA_g2s(_, _, k, 0), tAsA_g2s(_, _, k, 0));
+      }
     }
-  }
 
 #pragma unroll
-  for (int k = 0; k < size<2>(tBsB_g2s); ++k) {
-    if (get<1>(tBcB_g2s(0, 0, k)) >= -k_residue) { // blk_k coord < residue_k (gB shifted)
-      copy_if(g2s_tiled_copy_b, tBpB_g2s(_, k), tBgB_g2s(_, _, k, 0), tBsB_g2s(_, _, k, 0));
+    for (int k = 0; k < size<2>(tBsB_g2s); ++k) {
+      if (get<1>(tBcB_g2s(0, 0, k)) >= -k_residue) {
+        copy_if(g2s_tiled_copy_b, tBpB_g2s(_, k), tBgB_g2s(_, _, k, 0), tBsB_g2s(_, _, k, 0));
+      }
     }
   }
 
