@@ -70,6 +70,9 @@ def dynamic_mma_kernel(
     g2s_tiled_copy_a: cute.TiledCopy,
     g2s_tiled_copy_b: cute.TiledCopy,
     g2s_tiled_copy_c: cute.TiledCopy,
+    s2r_tiled_copy_a: cute.TiledCopy,
+    s2r_tiled_copy_b: cute.TiledCopy,
+    s2r_tiled_copy_c: cute.TiledCopy,
     r2s_tiled_copy_o: cute.TiledCopy,
     s2g_tiled_copy_o: cute.TiledCopy,
     sA_layout: cute.ComposedLayout,
@@ -133,12 +136,12 @@ def dynamic_mma_kernel(
     tBcB = thr_g2s_b.partition_S(cB)  # (CPY, CPY_N, CPY_K)
     tCcC = thr_g2s_c.partition_S(cC)  # (CPY, CPY_M, CPY_N)
 
-    # ----- M / N predicate tensors (independent of ik) -----
-    # Layout mirrors tensorop_gemm.py: the first mode is the CPY sub-mode
-    # (``tAgA.shape[0][1]`` — separate booleans for elements *within* a
-    # copy atom), the second mode is the tile's CPY_M, and the third is
-    # CPY_K with stride 0 so the same M/N predicate is replayed across
-    # every K coordinate in the tile.
+    # ----- M / N predicate (used for ik >= 1, i.e. all but the residue tile) -----
+    # Three-mode layout (rest_v, CPY_M, CPY_K) with the K mode broadcast at
+    # stride 0 so the same M/N predicate is replayed across every K iter.
+    # K-bound is not needed here because the domain_offset shift guarantees
+    # every K-tile from ik=1 onward is in-bounds; only the residue tile
+    # (handled by ``tApA_first`` below) needs the per-element K check.
     tApA = cute.make_rmem_tensor(
         cute.make_layout(
             (
@@ -197,17 +200,6 @@ def dynamic_mma_kernel(
     tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))
     tCrC = tiled_mma.make_fragment_C(thr_mma.partition_C(gC))
 
-    # S2R partitions reuse the same tiled_mma so the fragment layouts match
-    # the MMA atom directly (no explicit ldmatrix TiledCopy needed for this
-    # demo — the compiler will lower the universal copy onto LDS / LDSM).
-    universal = cute.nvgpu.CopyUniversalOp()
-    s2r_atom_a = cute.make_copy_atom(universal, mA.element_type)
-    s2r_atom_b = cute.make_copy_atom(universal, mB.element_type)
-    s2r_atom_c = cute.make_copy_atom(universal, mC.element_type)
-    s2r_tiled_copy_a = cute.make_tiled_copy_A(s2r_atom_a, tiled_mma)
-    s2r_tiled_copy_b = cute.make_tiled_copy_B(s2r_atom_b, tiled_mma)
-    s2r_tiled_copy_c = cute.make_tiled_copy_C(s2r_atom_c, tiled_mma)
-
     thr_s2r_a = s2r_tiled_copy_a.get_slice(tid)
     thr_s2r_b = s2r_tiled_copy_b.get_slice(tid)
     thr_s2r_c = s2r_tiled_copy_c.get_slice(tid)
@@ -215,19 +207,12 @@ def dynamic_mma_kernel(
     # ----- Mainloop: per K-tile predicated G2S, then S2R + MMA -----
     num_k_tiles = cute.size(tAgA, mode=[3])
 
-    # First K-tile (ik=0) needs per-element K-bound checks because the
-    # domain_offset shift can make some elements have negative gmem K
-    # coords. Build a per-element pred (rest_v, CPY_M, CPY_K with all
-    # strides distinct) that combines the M-bound and the K-bound check
-    # ``tile_k + k_residue >= 0`` for each per-thread CPY element.
-    #
-    # This per-element pred intentionally deviates from the C++ iteration-
-    # level gate ``if (get<1>(tAcA_g2s(0,0,k)) >= -k_residue)`` because
-    # that gate silently drops valid threads when K < BLK_K — a single ik
-    # can carry threads whose individual K-positions span the entire
-    # BLK_K range, some valid and some not. The C++ harness would fail
-    # tiny-K shapes for the same reason; we replace with a per-element
-    # pred (M-bound AND K-bound) so every valid thread fires its cp.async.
+    # Residue tile (ik = 0) needs a per-element predicate combining M-bound
+    # AND K-bound. The per-element K check (rather than the C++ iteration-
+    # level ``thread-0 K coord >= -k_residue`` gate) is required because
+    # with CPY_K = 1 a single iter carries lanes spread across the whole
+    # BLK_K range — some at valid in-bounds K-positions, others not — so the
+    # gate must fire per lane / per val element rather than per iter.
     tApA_first = cute.make_rmem_tensor(
         cute.make_layout(
             (
@@ -279,7 +264,6 @@ def dynamic_mma_kernel(
                     tBcB[(0, rest_v), n, k][1] + k_residue,
                 )
 
-    # Zero the smem tile so any predicated-off slot reads as zero.
     tAsA.fill(0)
     tBsB.fill(0)
     cute.arch.sync_threads()
@@ -506,6 +490,25 @@ def dynamic_mma_gemm(
     g2s_atom_c = cute.make_copy_atom(g2s_op, mC.element_type, num_bits_per_copy=128)
     g2s_tiled_copy_c = cute.make_tiled_copy_tv(g2s_atom_c, tlC_thr, tlC_val)
 
+    universal = cute.nvgpu.CopyUniversalOp()
+
+    # ----- S2R copies (ldmatrix for 16-bit operands) -----
+    # A/B own 4 32-bit packets per thread (VAL_EXPAND_K=2), so the x4 ldmatrix
+    # variant fits exactly. C has no K val-expand, so each thread only owns
+    # 2 32-bit packets — use the x2 ldmatrix variant when C is 16-bit. For
+    # wider C (e.g. fp32) fall back to a universal copy.
+    ldm_op_ab = cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4)
+    ldm_op_c = cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2)
+    s2r_atom_a = cute.make_copy_atom(ldm_op_ab, mA.element_type)
+    s2r_atom_b = cute.make_copy_atom(ldm_op_ab, mB.element_type)
+    s2r_tiled_copy_a = cute.make_tiled_copy_A(s2r_atom_a, tm)
+    s2r_tiled_copy_b = cute.make_tiled_copy_B(s2r_atom_b, tm)
+    if cutlass.const_expr(mC.element_type.width == 16):
+        s2r_atom_c = cute.make_copy_atom(ldm_op_c, mC.element_type)
+    else:
+        s2r_atom_c = cute.make_copy_atom(universal, mC.element_type)
+    s2r_tiled_copy_c = cute.make_tiled_copy_C(s2r_atom_c, tm)
+
     # ----- R2S + S2G copies for the smem-staged epilogue -----
     # R2S: MMA-derived TiledCopy so the per-thread register fragment lands
     # at its natural smem position under the swizzled sO layout. Pick the
@@ -513,7 +516,6 @@ def dynamic_mma_gemm(
     # ``stmatrix`` (x2 because the C/O fragment has no K val-expand and so
     # owns 2 32-bit packets per thread); otherwise fall back to a universal
     # STS lowering.
-    universal = cute.nvgpu.CopyUniversalOp()
     sm_major, _ = torch.cuda.get_device_capability()
     if cutlass.const_expr(sm_major >= 9 and mO.element_type.width == 16):
         stm_op = cute.nvgpu.warp.StMatrix8x8x16bOp(False, 2)
@@ -550,6 +552,9 @@ def dynamic_mma_gemm(
         g2s_tiled_copy_a,
         g2s_tiled_copy_b,
         g2s_tiled_copy_c,
+        s2r_tiled_copy_a,
+        s2r_tiled_copy_b,
+        s2r_tiled_copy_c,
         r2s_tiled_copy_o,
         s2g_tiled_copy_o,
         sA_layout,
