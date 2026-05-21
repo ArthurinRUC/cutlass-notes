@@ -19,11 +19,11 @@ The prologue mirrors ``pipelining.cu`` lines 156-214:
   * ``cp_async_wait_group(NUM_STAGES-2)`` and a single ``ldmatrix`` of
     k_block=0 from smem stage 0 before entering the mainloop.
 
-The mainloop mirrors ``tensorop_gemm.py`` lines 613-669: for each k-tile
-we walk all ``num_k_block`` MMA k-iterations, prefetch the next rmem at
-the top, fire the next stage's cp.async on k_block==0, then issue the
-tensor-core gemm. Three counters (``smem_pipe_read``, ``smem_pipe_write``,
-``k_tile_index``) track ring-buffer state.
+The mainloop walks all ``num_k_block`` MMA k-iterations per k-tile,
+prefetches the next rmem at the top, fires the next stage's cp.async
+on ``k_block == 0``, then issues the tensor-core gemm. Three counters
+(``smem_pipe_read``, ``smem_pipe_write``, ``k_tile_index``) track the
+ring-buffer state.
 
 Three dtype specs are exercised, matching ``pipelining.py``:
 
@@ -149,7 +149,12 @@ def pipelining_kernel(
     tBcB = thr_g2s_b.partition_S(cB)
     tCcC = thr_g2s_c.partition_S(cC)
 
-    # ----- M / N predicate tensors (replayed across K) -----
+    # ----- M / N predicate (used for prologue stages 1.. and the mainloop) -----
+    # Three-mode layout (rest_v, CPY_M, CPY_K) with the K mode broadcast at
+    # stride 0 so the same M/N predicate is replayed across every K iter.
+    # K-bound is not needed here because the domain_offset shift guarantees
+    # every K-tile from stage 1 onward is in-bounds; only stage 0 (handled
+    # by ``tApA_first`` below) needs the per-element K check.
     tApA = cute.make_rmem_tensor(
         cute.make_layout(
             (
@@ -219,20 +224,11 @@ def pipelining_kernel(
     # G2S prologue: prefetch NUM_STAGES-1 stages.
     # =========================================================================
 
-    # Stage 0: clear smem then issue predicated copies. The iter-level
-    # guard ``elem_less(-1, tAcA[0,0,k][1])`` is replaced by a per-element
-    # K-bound pred (combined with M-bound) because with CPY_K=1 the same
-    # iter carries threads spread across the whole BLK_K range — some of
-    # which sit at valid in-bounds K-positions even when thread-0-element-0
-    # does not (e.g. K < BLK_K with k_residue large negative).
-    #
-    # This per-element pred intentionally deviates from the C++ iteration-
-    # level gate ``if (get<1>(tAcA_g2s(0,0,k)) >= -k_residue)`` because
-    # that gate silently drops valid threads when K < BLK_K — a single
-    # ik can carry threads whose individual K-positions span the entire
-    # BLK_K range, some valid and some not. The C++ harness would fail
-    # tiny-K shapes for the same reason; we replace with a per-element
-    # pred (M-bound AND K-bound) so every valid thread fires its cp.async.
+    # Stage 0 (residue tile) needs a per-element predicate combining M-bound
+    # AND K-bound. With CPY_K = 1 a single iter carries lanes spread across
+    # the whole BLK_K range — some at valid in-bounds K-positions, others
+    # not after the domain_offset shift — so the gate must fire per lane /
+    # per val element rather than at the C++ iteration level.
     tApA_first = cute.make_rmem_tensor(
         cute.make_layout(
             (
@@ -574,13 +570,23 @@ def pipelining_gemm(
     g2s_atom_c = cute.make_copy_atom(g2s_op, mC.element_type, num_bits_per_copy=128)
     g2s_tiled_copy_c = cute.make_tiled_copy_tv(g2s_atom_c, tlC_thr, tlC_val)
 
-    # ----- S2R copies (universal — DSL lowers to LDS / LDSM as appropriate) -----
     universal = cute.nvgpu.CopyUniversalOp()
-    s2r_atom_a = cute.make_copy_atom(universal, mA.element_type)
-    s2r_atom_b = cute.make_copy_atom(universal, mB.element_type)
-    s2r_atom_c = cute.make_copy_atom(universal, mC.element_type)
+
+    # ----- S2R copies (ldmatrix for 16-bit operands) -----
+    # A/B own 4 32-bit packets per thread (VAL_EXPAND_K=2), so the x4 ldmatrix
+    # variant fits exactly. C has no K val-expand, so each thread only owns
+    # 2 32-bit packets — use the x2 ldmatrix variant when C is 16-bit. For
+    # wider C (e.g. fp32) fall back to a universal copy.
+    ldm_op_ab = cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4)
+    ldm_op_c = cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2)
+    s2r_atom_a = cute.make_copy_atom(ldm_op_ab, mA.element_type)
+    s2r_atom_b = cute.make_copy_atom(ldm_op_ab, mB.element_type)
     s2r_tiled_copy_a = cute.make_tiled_copy_A(s2r_atom_a, tm)
     s2r_tiled_copy_b = cute.make_tiled_copy_B(s2r_atom_b, tm)
+    if cutlass.const_expr(mC.element_type.width == 16):
+        s2r_atom_c = cute.make_copy_atom(ldm_op_c, mC.element_type)
+    else:
+        s2r_atom_c = cute.make_copy_atom(universal, mC.element_type)
     s2r_tiled_copy_c = cute.make_tiled_copy_C(s2r_atom_c, tm)
 
     # ----- R2S + S2G copies for the smem-staged epilogue -----

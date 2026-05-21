@@ -81,7 +81,6 @@ def swizzling_kernel(
     sB_layout: cute.ComposedLayout,
     sC_layout: cute.ComposedLayout,
     sO_layout: cute.ComposedLayout,
-    acc_dtype: cutlass.Constexpr,
     out_dtype: cutlass.Constexpr,
     is_gemm: cutlass.Constexpr[bool],
 ):
@@ -144,16 +143,16 @@ def swizzling_kernel(
     else:
         # Load C from smem in its native dtype (mC.element_type), then convert
         # into the accumulator fragment. The intermediate is required when
-        # acc_dtype differs from mC.element_type (e.g. fp16->fp32): the DSL's
-        # ``cute.copy`` requires source/destination bit widths to match, so
-        # the dtype change has to happen on a register-to-register ``.to()``
-        # step. When acc_dtype == mC.element_type this is a no-op cast.
+        # the accumulator dtype differs from mC.element_type (e.g. fp16->fp32):
+        # the DSL's ``cute.copy`` requires source/destination bit widths to
+        # match, so the dtype change has to happen on a register-to-register
+        # ``.to()`` step. When acc dtype == mC.element_type this is a no-op cast.
         thr_s2r_c = s2r_tiled_copy_c.get_slice(tid)
         tCrC_pre = cute.make_fragment_like(tCrC, mC.element_type)
         tCsC_s2r = thr_s2r_c.partition_S(sC)
         tCrC_s2r = thr_s2r_c.retile(tCrC_pre)
         cute.copy(s2r_tiled_copy_c, tCsC_s2r, tCrC_s2r)
-        tCrC.store(tCrC_pre.load().to(acc_dtype))
+        tCrC.store(tCrC_pre.load().to(tCrC.element_type))
 
     # ----- Phase 3: compute -----
     cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)
@@ -328,7 +327,6 @@ def swizzling_gemm(
         sB_layout,
         sC_layout,
         sO_layout,
-        acc_dtype,
         out_dtype,
         is_gemm,
     ).launch(grid=(1, 1, 1), block=(NUM_THREADS, 1, 1), stream=stream)
