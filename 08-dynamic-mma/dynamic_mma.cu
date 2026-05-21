@@ -352,11 +352,53 @@ struct KernelSpec {
 
   using TiledMMA = decltype(make_tiled_mma(MMA_op{}, MMAThrLayout{}, MMATileLayout{}));
 
-  // 为什么直接用 AutoVectorizingCopy 会出现 RuntimeError: CUDA error: misaligned address？
-  // using Copy_G2S_op = AutoVectorizingCopy; -> cp.async.ca.shared.global.L2::128B
-  // 这样也 OK！
-  // using Copy_G2S_op = SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>;
-  // 但还是 cp.async.cg 最好
+  // Why AutoVectorizingCopy faults under copy_if (CUDA error 716, "misaligned
+  // address"):
+  //
+  //   `AutoVectorizingCopyWithAssumedAlignment<MaxBits>` inherits from
+  //   `UniversalCopy<uint_bit_t<MaxBits>>`, so `AutoVectorizingCopy` (=
+  //   `<128>`) is structurally a 128-bit atom applied to whatever element
+  //   type the tensor has.
+  //
+  //   In `cute/algorithm/copy.hpp`, the `copy()` overload for AutoVec does a
+  //   `recast<uint_bit_t<vec_bits>>` of src/dst BEFORE issuing the atom:
+  //
+  //       copy(AutoVec<N>, src, dst)
+  //         -> recast<uintN>(src/dst)        // fp16 -> uint128_t view
+  //         -> copy_if(true, src_v, dst_v)   // 1 atom call per iter
+  //
+  //   But `copy_if(Copy_Atom<AutoVec<N>, T>, pred, src, dst)` has NO matching
+  //   recast specialization. It falls through to the generic Copy_Atom
+  //   path that unrolls atom calls over the per-thread tile WITHOUT
+  //   recasting. With val (1, 8) of fp16 we get 8 atom calls at stride
+  //   1 fp16 (= 2 B), each invoking the 128-bit atom:
+  //
+  //       ld.global.nc.v2.u64 [base + 0]    aligned
+  //       ld.global.nc.v2.u64 [base + 2]    misaligned -> fault
+  //       ld.global.nc.v2.u64 [base + 4]    misaligned
+  //       ...
+  //       ld.global.nc.v2.u64 [base + 14]   misaligned
+  //
+  //   These loads also have NO @p in PTX: copy_if's `if (pred)` becomes one
+  //   coarse `setp + @p bra` gating the whole block. NVCC faithfully lowers
+  //   exactly what CUTLASS asked for; the broken stride is at the CUTLASS
+  //   layer, not at NVCC.
+  //
+  // Tracked upstream: NVIDIA/cutlass#2354 ("Missing copy_if implementation
+  // for AutoVectorizingCopyWithAssumedAlignment"). As of CUTLASS main the
+  // bug is still present -- no copy_if(AutoVec<N>, ...) specialization has
+  // been merged. The official workaround in
+  // cutlass/examples/cute/tutorial/tiled_copy_if.cu is to bake the width
+  // into the atom type explicitly:
+  //
+  //   using CopyOp = UniversalCopy<uint_byte_t<sizeof(T) * size(val_layout)>>;
+  //
+  // SM80_CP_ASYNC_CACHEGLOBAL<uint128_t> follows the same principle: its
+  // atom is 16 B intrinsically, so val (1, 8) collapses to one atom call per
+  // iter -> one aligned `cp.async.cg.shared.global [smem], [gmem], 16` per
+  // thread. It also drives the cp_async_fence / cp_async_wait pipeline
+  // (AutoVec is sync ld+st, the fences become no-ops with respect to data
+  // motion).
   using Copy_G2S_op = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
 
   // Note: ldmatrix only support 16-bit data type (or below)
