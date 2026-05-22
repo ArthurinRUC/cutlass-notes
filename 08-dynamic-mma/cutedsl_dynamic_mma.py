@@ -264,6 +264,12 @@ def dynamic_mma_kernel(
                     tBcB[(0, rest_v), n, k][1] + k_residue,
                 )
 
+    # Zero the A/B smem ONCE before the K-loop (hoisted out of the mainloop).
+    # The G2S copy is predicated, so predicated-off slots are never written by
+    # cp.async; pre-zeroing lets them read as 0. A single clear suffices: the
+    # M-boundary rows masked off by the M-only predicate are never written by
+    # any K-tile, and the ik=0 K-residue columns are overwritten by every
+    # later (full) K-tile.
     tAsA.fill(0)
     tBsB.fill(0)
     cute.arch.sync_threads()
@@ -316,8 +322,6 @@ def dynamic_mma_kernel(
     # Remaining K-tiles (ik = 1..num_k_tiles-1) — full M/N predication only,
     # K is guaranteed in-bounds by the residue shift.
     for ik in cutlass.range(num_k_tiles - 1, unroll_full=False):
-        tAsA.fill(0)
-        tBsB.fill(0)
         cute.copy(
             g2s_tiled_copy_a,
             tAgA[None, None, None, ik + 1],
