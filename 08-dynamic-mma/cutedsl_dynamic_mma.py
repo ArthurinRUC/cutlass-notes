@@ -567,6 +567,15 @@ def dynamic_mma_gemm(
         grid=(grid_n, grid_m, 1),
         block=(NUM_THREADS, 1, 1),
         stream=stream,
+        # nvvm.minctasm hint: require >= 2 resident blocks per SM. Left
+        # unconstrained the CuTeDSL register allocator is ILP-greedy and
+        # inflates to ~150 registers/thread (not a spill -- just a loose
+        # allocation), which caps occupancy at one block per SM on
+        # H100/H200. The hint tightens the budget so the kernel fits at
+        # 128 registers/thread with zero spill, roughly doubling achieved
+        # occupancy. 2 is the largest spill-free value here -- 3+ would
+        # force register spills to local memory.
+        min_blocks_per_mp=2,
     )
 
 
