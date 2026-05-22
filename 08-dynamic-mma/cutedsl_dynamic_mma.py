@@ -702,7 +702,7 @@ def main() -> None:
     print(" Compiling fp16 in / fp32 acc / fp16 out ... ".center(PRINT_LENGTH, "-"))
     a_t = torch.empty(M0, K0, device="cuda", dtype=torch.float16)
     b_t = torch.empty(N0, K0, device="cuda", dtype=torch.float16)
-    c_t = torch.empty(M0, N0, device="cuda", dtype=torch.float16)
+    c_t = torch.empty(M0, N0, device="cuda", dtype=torch.float32)
     o_t = torch.empty(M0, N0, device="cuda", dtype=torch.float16)
     fp16f32_clear, fp16f32_accum = _compile_pair(
         a_t,
@@ -733,6 +733,7 @@ def main() -> None:
     # NOT validated against torch — fp16 accumulation drops too many bits
     # for large K to match torch's fp32-accumulated reference.
     print(" fp16 = fp16 * fp16 + fp16 (exercise only) ".center(PRINT_LENGTH, "="))
+    torch.cuda.manual_seed_all(9527)
     for m, n, k in exps:
         print(f" M={m}, N={n}, K={k} ".center(PRINT_LENGTH, "-"))
         a = torch.randn(m, k, device="cuda", dtype=torch.float16)
@@ -746,12 +747,13 @@ def main() -> None:
         torch.cuda.synchronize()
 
     # ----- Sweep: fp16 in, fp32 acc, fp16 out (Spec 2) -----
-    print(" fp16 = fp32_acc(fp16 * fp16) + fp16 ".center(PRINT_LENGTH, "="))
+    print(" fp16 = fp32_acc(fp16 * fp16) + fp32 ".center(PRINT_LENGTH, "="))
+    torch.cuda.manual_seed_all(9527)
     for m, n, k in exps:
         print(f" M={m}, N={n}, K={k} ".center(PRINT_LENGTH, "-"))
         a = torch.randn(m, k, device="cuda", dtype=torch.float16)
         b = torch.randn(n, k, device="cuda", dtype=torch.float16)
-        c = torch.randn(m, n, device="cuda", dtype=torch.float16)
+        c = torch.randn(m, n, device="cuda", dtype=torch.float32)
 
         out = torch.empty(m, n, device="cuda", dtype=torch.float16)
         fp16f32_clear(a, b, c.clone(), out)
@@ -761,10 +763,11 @@ def main() -> None:
         out = torch.empty(m, n, device="cuda", dtype=torch.float16)
         fp16f32_accum(a, b, c.clone(), out)
         torch.cuda.synchronize()
-        compare_matrix(out, torch.addmm(c.float(), a.float(), b.T.float()).half(), counters)
+        compare_matrix(out, torch.addmm(c, a.float(), b.T.float()).half(), counters)
 
     # ----- Sweep: bf16 in, fp32 acc, bf16 out (Spec 3) -----
     print(" bf16 = fp32_acc(bf16 * bf16) + fp32 ".center(PRINT_LENGTH, "="))
+    torch.cuda.manual_seed_all(9527)
     for m, n, k in exps:
         print(f" M={m}, N={n}, K={k} ".center(PRINT_LENGTH, "-"))
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
