@@ -170,10 +170,16 @@ __global__ __launch_bounds__(Spec::kThreadNum) void dynamic_mma(void *__restrict
 
   int NTilesK = ceil_div(K, kBlockK);
 
+  // Zero the A/B smem ONCE before the K-loop (hoisted out of the mainloop).
+  // The predicated cp.async never writes masked-off slots, so they must read
+  // as 0. A single clear suffices: the M-boundary rows masked off by the
+  // M-only predicate are never written by any K-tile, and the ik=0 K-residue
+  // columns are overwritten by every later (full) K-tile.
+  clear(tAsA_g2s);
+  clear(tBsB_g2s);
+  __syncthreads();
+
   for (int ik = 0; ik < NTilesK; ++ik) {
-    // Clear the smem tiles to account for predicated off loads
-    clear(tAsA_g2s);
-    clear(tBsB_g2s);
     if (ik == 0) {
 #pragma unroll
       for (int k = 0; k < size<2>(tAsA_g2s); ++k) {
