@@ -426,7 +426,7 @@ def main() -> None:
     print(" Compiling fp16 in / fp32 acc / fp16 out ... ".center(PRINT_LENGTH, "-"))
     a_t = torch.empty(M, K, device="cuda", dtype=torch.float16)
     b_t = torch.empty(N, K, device="cuda", dtype=torch.float16)
-    c_t = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    c_t = torch.empty(M, N, device="cuda", dtype=torch.float32)
     o_t = torch.empty(M, N, device="cuda", dtype=torch.float16)
     fp16f32_clear, fp16f32_accum = _compile_pair(
         a_t,
@@ -468,7 +468,7 @@ def main() -> None:
     print(f" M={M}, N={N}, K={K} ".center(PRINT_LENGTH, "-"))
 
     # ----- Spec 1: fp16 = fp16 * fp16 + fp32 (validated) -----
-    print(" fp16 = fp32_acc(fp16 * fp16) + fp16 ".center(PRINT_LENGTH, "="))
+    print(" fp16 = fp32_acc(fp16 * fp16) + fp32 ".center(PRINT_LENGTH, "="))
     torch.cuda.manual_seed_all(9527)
     a = torch.randn(M, K, device="cuda", dtype=torch.float16)
     b = torch.randn(N, K, device="cuda", dtype=torch.float16)
@@ -476,14 +476,14 @@ def main() -> None:
 
     # Case 1: MM (fp16 = fp16 * fp16)
     out = torch.empty(M, N, device="cuda", dtype=torch.float16)
-    fp16f32_clear(a, b, c.clone().half(), out)
+    fp16f32_clear(a, b, c.clone(), out)
     torch.cuda.synchronize()
     # For fp16 input, torch.matmul uses fp32 as the accumulator precision
-    compare_matrix(out, torch.matmul(a.float(), b.T.float()).half(), counters)
+    compare_matrix(out, torch.matmul(a, b.T), counters)
 
     # Case 2: MMA (fp16 = fp16 * fp16 + fp16)
     out = torch.empty(M, N, device="cuda", dtype=torch.float16)
-    fp16f32_accum(a, b, c.clone().half(), out)
+    fp16f32_accum(a, b, c.clone(), out)
     torch.cuda.synchronize()
     compare_matrix(out, torch.addmm(c, a.float(), b.T.float()).half(), counters)
 
