@@ -139,13 +139,13 @@ def warp_specialization_kernel(
     if cutlass.const_expr(not is_gemm):
         c_mbar_ptr = storage.c_mbar_array.data_ptr()
 
-    # Alias sC/sD on top of sB's smem region (sB has the larger byte
-    # footprint of the two AB staged buffers, and the mainloop fully
-    # completes — with a MMA-scoped NamedBarrier — before the epilogue
-    # touches sC/sD, so this overlap is safe and saves ~128KB.
-    sC_ptr = cute.recast_ptr(sB_full.iterator, sC_layout.inner, dtype=c_dtype)
+    # Alias sC/sD over the combined sA+sB smem region (sA and sB are
+    # contiguous in SharedStorage). The mainloop completes before the
+    # epilogue touches sC/sD, so reusing that smem is safe; the full
+    # A+B span is needed because an fp32 C tile exceeds sB alone.
+    sC_ptr = cute.recast_ptr(sA_full.iterator, sC_layout.inner, dtype=c_dtype)
     sC = cute.make_tensor(sC_ptr, sC_layout.outer)
-    sD_ptr = cute.recast_ptr(sB_full.iterator, sD_layout.inner, dtype=out_dtype)
+    sD_ptr = cute.recast_ptr(sA_full.iterator, sD_layout.inner, dtype=out_dtype)
     sD = cute.make_tensor(sD_ptr, sD_layout.outer)
 
     # ----- Pipeline (TMA load mainloop barriers) -----
@@ -682,6 +682,7 @@ def main() -> None:
 
     # ----- Spec 2: fp16 in, fp32 acc, fp16 out -----
     print(" Compiling fp16 in / fp32 acc / fp16 out ... ".center(PRINT_LENGTH, "-"))
+    c_t = torch.empty(M0, N0, device="cuda", dtype=torch.float32)
     fp16f32_clear, fp16f32_accum = _compile_pair(
         a_t,
         b_t,
@@ -695,7 +696,7 @@ def main() -> None:
     print(" Compiling bf16 in / fp32 acc / bf16 out ... ".center(PRINT_LENGTH, "-"))
     a_t = torch.empty(M0, K0, device="cuda", dtype=torch.bfloat16)
     b_t = torch.empty(N0, K0, device="cuda", dtype=torch.bfloat16)
-    c_t = torch.empty(M0, N0, device="cuda", dtype=torch.bfloat16)
+    c_t = torch.empty(M0, N0, device="cuda", dtype=torch.float32)
     d_t = torch.empty(M0, N0, device="cuda", dtype=torch.bfloat16)
     bf16_clear, bf16_accum = _compile_pair(
         a_t,
@@ -708,6 +709,7 @@ def main() -> None:
 
     # ----- Sweep: Spec 1 (fp16 / fp16 / fp16, exercise only) -----
     print(" fp16 = fp16 * fp16 + fp16 (exercise only) ".center(PRINT_LENGTH, "="))
+    torch.cuda.manual_seed_all(9527)
     for m, n, k in EXPS:
         print(f" M={m}, N={n}, K={k} ".center(PRINT_LENGTH, "-"))
         a = torch.randn(m, k, device="cuda", dtype=torch.float16)
@@ -721,12 +723,13 @@ def main() -> None:
         torch.cuda.synchronize()
 
     # ----- Sweep: Spec 2 (fp16 in, fp32 acc, fp16 out) -----
-    print(" fp16 = fp32_acc(fp16 * fp16) + fp16 ".center(PRINT_LENGTH, "="))
+    print(" fp16 = fp32_acc(fp16 * fp16) + fp32 ".center(PRINT_LENGTH, "="))
+    torch.cuda.manual_seed_all(9527)
     for m, n, k in EXPS:
         print(f" M={m}, N={n}, K={k} ".center(PRINT_LENGTH, "-"))
         a = torch.randn(m, k, device="cuda", dtype=torch.float16)
         b = torch.randn(n, k, device="cuda", dtype=torch.float16)
-        c = torch.randn(m, n, device="cuda", dtype=torch.float16)
+        c = torch.randn(m, n, device="cuda", dtype=torch.float32)
 
         out = torch.empty(m, n, device="cuda", dtype=torch.float16)
         fp16f32_clear(a, b, c.clone(), out)
@@ -736,15 +739,16 @@ def main() -> None:
         out = torch.empty(m, n, device="cuda", dtype=torch.float16)
         fp16f32_accum(a, b, c.clone(), out)
         torch.cuda.synchronize()
-        compare_matrix(out, torch.addmm(c.float(), a.float(), b.T.float()).half(), counters)
+        compare_matrix(out, torch.addmm(c, a.float(), b.T.float()).half(), counters)
 
     # ----- Sweep: Spec 3 (bf16 in, fp32 acc, bf16 out) -----
-    print(" bf16 = fp32_acc(bf16 * bf16) + bf16 ".center(PRINT_LENGTH, "="))
+    print(" bf16 = fp32_acc(bf16 * bf16) + fp32 ".center(PRINT_LENGTH, "="))
+    torch.cuda.manual_seed_all(9527)
     for m, n, k in EXPS:
         print(f" M={m}, N={n}, K={k} ".center(PRINT_LENGTH, "-"))
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-        c = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+        c = torch.randn(m, n, device="cuda", dtype=torch.float32)
 
         out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
         bf16_clear(a, b, c.clone(), out)
@@ -756,7 +760,7 @@ def main() -> None:
         torch.cuda.synchronize()
         compare_matrix(
             out,
-            torch.addmm(c.float(), a.float(), b.T.float()).bfloat16(),
+            torch.addmm(c, a.float(), b.T.float()).bfloat16(),
             counters,
         )
 
