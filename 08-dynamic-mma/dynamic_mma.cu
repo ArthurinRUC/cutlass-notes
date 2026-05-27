@@ -175,9 +175,13 @@ __global__ __launch_bounds__(Spec::kThreadNum) void dynamic_mma(void *__restrict
   // as 0. A single clear suffices: the M-boundary rows masked off by the
   // M-only predicate are never written by any K-tile, and the ik=0 K-residue
   // columns are overwritten by every later (full) K-tile.
+  //
+  // No sync between the clear and the cp.async: each thread's clear targets
+  // the same g2s partition slots that its cp.async then writes, so program
+  // order within a thread suffices. The __syncthreads() after cp_async_wait
+  // below publishes both the zeros and the cp.async data to the s2r readers.
   clear(tAsA_g2s);
   clear(tBsB_g2s);
-  __syncthreads();
 
   for (int ik = 0; ik < NTilesK; ++ik) {
     if (ik == 0) {

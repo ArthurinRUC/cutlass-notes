@@ -270,9 +270,13 @@ def dynamic_mma_kernel(
     # M-boundary rows masked off by the M-only predicate are never written by
     # any K-tile, and the ik=0 K-residue columns are overwritten by every
     # later (full) K-tile.
+    #
+    # No sync between the fill and the cp.async: each thread's fill targets the
+    # same g2s partition slots that its cp.async then writes, so program order
+    # within a thread suffices. The post-wait_group sync_threads below is what
+    # publishes both the zeros and the cp.async data to the s2r readers.
     tAsA.fill(0)
     tBsB.fill(0)
-    cute.arch.sync_threads()
     cute.copy(
         g2s_tiled_copy_a,
         tAgA[None, None, None, 0],

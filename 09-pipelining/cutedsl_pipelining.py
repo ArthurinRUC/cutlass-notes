@@ -280,9 +280,12 @@ def pipelining_kernel(
                     tBcB[(0, rest_v), n, k][1] + k_residue,
                 )
 
+    # Pre-zero stage 0 so predicate-off slots read as 0. Each thread fills its
+    # own g2s partition slots and the following cp.async writes that same
+    # partition, so program order suffices — the post-wait_group sync_threads
+    # below publishes both the zeros and the loads to the s2r readers.
     tAsA[None, None, None, 0].fill(0)
     tBsB[None, None, None, 0].fill(0)
-    cute.arch.sync_threads()
     cute.copy(
         g2s_tiled_copy_a,
         tAgA[None, None, None, 0],
