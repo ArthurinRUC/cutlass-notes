@@ -8,9 +8,13 @@ CuTe DSL counterpart of ``pipelining.cu`` / ``pipelining.py``. Extends
      mainloop's last k-block triggers ``cp_async_wait_group(NUM_STAGES-2)``
      so at most one outstanding cp.async group is in flight while the
      register pipeline consumes the freshly arrived stage.
-  2. **S2R (register) pipeline**. The smem -> rmem load for k_block + 1
-     is hoisted ahead of the MMA for k_block, so the LDS / LDSM latency
-     is hidden behind the tensor-core math.
+  2. **S2R (register) pipeline**, gated by the ``REG_STAGES`` constant.
+     With ``REG_STAGES >= 2`` (default) the smem -> rmem load for
+     k_block + 1 is hoisted ahead of the MMA for k_block, so the LDS /
+     LDSM latency is hidden behind the tensor-core math. Setting
+     ``REG_STAGES == 1`` disables the register pipeline (``pipelining_no_
+     reg_prefetch.cu``): each k-tile loads its whole A/B fragment, then
+     runs every MMA, leaving only the G2S pipeline to overlap work.
 
 The prologue mirrors ``pipelining.cu`` lines 156-214:
   * predicated K-residue copy for stage 0 (shifted by ``k_residue``);
@@ -33,14 +37,26 @@ Three dtype specs are exercised, matching ``pipelining.py``:
 
 Run with ``python cutedsl_pipelining.py``.
 
-Caveats:
-  * The C++ kernel overlaps ``sC`` with ``sA`` to keep dynamic smem
-    under the device limit. This DSL port keeps the four smem buffers
-    (sA pipe, sB pipe, sC, sO) disjoint; the smem footprint shown by
-    the runtime is ``A_pipe + B_pipe + C + O``, which fits comfortably
-    under H100/B200's 228KB / 232KB dynamic smem cap for the default
-    128x128x64 tile. The epilogue mirrors 08-dynamic-mma: R2S -> S2G
-    via a swizzled smem buffer sO (Swizzle<3,3,3> o (8 x min(64, BLK_N))),
+Smem footprint / occupancy:
+  * Only the multi-stage A/B pipeline gets real smem (``A_pipe + B_pipe``;
+    96KB for the default 128x128x64 tile at 3 stages). The C addend and the
+    O store buffer are never live during the mainloop, so the epilogue
+    aliases them over the (drained) A/B smem, mirroring 13-/14-*. This keeps
+    the block under the ~113KB needed for two resident CTAs per SM.
+  * To realise that second block the launch sets ``min_blocks_per_mp=2``
+    (mirrors 08-dynamic-mma): without it CuTeDSL's allocator runs
+    ILP-greedy to ~160 reg/thread and caps occupancy at one block/SM. The
+    hint tightens the budget to 128 reg/thread, letting two blocks
+    co-reside (~24% achieved occupancy vs ~12.5%). At that cap the
+    no-prefetch path (``REG_STAGES == 1``) fits spill-free, while the
+    register-prefetch path (``REG_STAGES >= 2``) keeps an extra k_block
+    fragment live and spills lightly to (L1-resident) local memory — which
+    is why the no-prefetch path is the faster configuration on H200 here
+    (448us vs 527us at M=N=K=4096, bf16).
+  * C is folded into the accumulator in the epilogue (acc starts at zero,
+    acc += C after the matmul) rather than preloaded, so sC need not coexist
+    with the pipeline. The epilogue then narrows to out_dtype and drains
+    R2S -> S2G via a swizzled sO (Swizzle<3,3,3> o (8 x min(64, BLK_N))),
     with a 2-D (CCPY_M, CCPY_N) S2G predicate for M/N residue handling.
 """
 
@@ -55,7 +71,16 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 BLK_M = 128
 BLK_N = 128
 BLK_K = 64
+# G2S (smem) ring-buffer depth.
 NUM_STAGES = 3
+# Register-pipeline (S2R) depth, mirroring ``prefetch_s2r_tiles`` in the C++:
+#   * ``REG_STAGES >= 2`` double-buffers the smem -> rmem load, hoisting the
+#     k_block + 1 fetch ahead of the k_block MMA (the default fast path).
+#   * ``REG_STAGES == 1`` disables register prefetch entirely: each k-tile
+#     loads its whole A/B fragment, then runs every MMA — only the
+#     GMEM -> SMEM -> RF copy pipeline overlaps work. Mirrors
+#     ``pipelining_no_reg_prefetch.cu``.
+REG_STAGES = 1
 
 MMA_INST_MNK = (16, 8, 16)
 ATOM_LAYOUT_MNK = (2, 4, 1)
@@ -121,12 +146,14 @@ def pipelining_kernel(
     gA = cute.domain_offset((0, k_residue, 0), gA)
     gB = cute.domain_offset((0, k_residue, 0), gB)
 
-    # ----- Smem allocation (multi-stage A/B, single-stage C, single-stage O) -----
+    # ----- Smem allocation -----
+    # Only the multi-stage A/B pipeline gets real storage. sC (accumulate
+    # addend) and sO (epilogue store buffer) are never live during the
+    # mainloop, so the epilogue aliases them over this same A/B smem (see
+    # below). Footprint stays at sA + sB so two CTAs fit per SM.
     smem = cutlass.utils.SmemAllocator()
     sA = smem.allocate_tensor(mA.element_type, sA_layout, byte_alignment=16)
     sB = smem.allocate_tensor(mB.element_type, sB_layout, byte_alignment=16)
-    sC = smem.allocate_tensor(mC.element_type, sC_layout, byte_alignment=16)
-    sO = smem.allocate_tensor(out_dtype, sO_layout, byte_alignment=16)
 
     # ----- G2S partitions (predicated) -----
     thr_g2s_a = g2s_tiled_copy_a.get_slice(tid)
@@ -137,9 +164,11 @@ def pipelining_kernel(
     tBgB = thr_g2s_b.partition_S(gB)  # (CPY, CPY_N, CPY_K, k_tiles)
     tBsB = thr_g2s_b.partition_D(sB)  # (CPY, CPY_N, CPY_K, PIPE)
 
+    # C is loaded in the epilogue (folded into the accumulator there), so its
+    # smem partition is built then; only the gmem-side partition is needed up
+    # front for the identity-coord predicate setup.
     thr_g2s_c = g2s_tiled_copy_c.get_slice(tid)
     tCgC = thr_g2s_c.partition_S(gC)  # (CPY, CPY_M, CPY_N)
-    tCsC = thr_g2s_c.partition_D(sC)  # (CPY, CPY_M, CPY_N)
 
     # ----- Identity tensors for predication -----
     cA = cute.make_identity_tensor((BLK_M, BLK_K))
@@ -189,21 +218,6 @@ def pipelining_kernel(
                 tBcB[(0, rest_v), n, 0][0],
                 n_max,
             )
-
-    # ----- Preload C (if accumulating) -----
-    if cutlass.const_expr(not is_gemm):
-        tCsC.fill(0)
-        for m in cutlass.range_constexpr(cute.size(tCgC, mode=[1])):
-            for n in cutlass.range_constexpr(cute.size(tCgC, mode=[2])):
-                if cute.elem_less(tCcC[0, m, n][0], m_max) and cute.elem_less(
-                    tCcC[0, m, n][1],
-                    n_max,
-                ):
-                    cute.copy(
-                        g2s_tiled_copy_c,
-                        tCgC[None, m, n],
-                        tCsC[None, m, n],
-                    )
 
     # ----- Fragments -----
     thr_mma = tiled_mma.get_slice(tid)
@@ -323,7 +337,7 @@ def pipelining_kernel(
         k_tile_index = k_tile_index + 1
 
     # =========================================================================
-    # Register prefetch: wait for stage 0, load k_block 0 to rmem.
+    # Wait for the prologue's stage-0 cp.async, then prime the accumulator.
     # =========================================================================
     cute.arch.cp_async_wait_group(NUM_STAGES - 2)
     cute.arch.sync_threads()
@@ -332,118 +346,221 @@ def pipelining_kernel(
     smem_pipe_read = cutlass.Int32(0)
     smem_pipe_write = cutlass.Int32(NUM_STAGES - 1)
 
-    # Prefetch first k_block from stage 0 into registers.
-    cute.copy(
-        s2r_tiled_copy_a,
-        tAsA_s2r[None, None, 0, smem_pipe_read],
-        tArA_s2r[None, None, 0],
-    )
-    cute.copy(
-        s2r_tiled_copy_b,
-        tBsB_s2r[None, None, 0, smem_pipe_read],
-        tBrB_s2r[None, None, 0],
-    )
+    # ----- Initialise accumulator to zero -----
+    # The C addend (accumulate path) is folded in during the epilogue, not
+    # preloaded here, so sC stays out of the mainloop and can alias the A/B
+    # smem. Both mainloops therefore start from a zeroed accumulator.
+    tCrC.fill(0.0)
 
-    # ----- Initialise / preload accumulator -----
-    if cutlass.const_expr(is_gemm):
-        tCrC.fill(0.0)
-    else:
-        # ComputeTypeC may differ from accumulator dtype (e.g. fp16 -> fp32):
-        # load into a same-dtype fragment first, then convert via .store/.load.
-        tCrC_pre = cute.make_fragment_like(tCrC, mC.element_type)
+    if cutlass.const_expr(REG_STAGES >= 2):
+        # =====================================================================
+        # Register-prefetch (S2R) pipeline. The smem -> rmem load for
+        # k_block + 1 is hoisted ahead of the MMA for k_block so the LDS /
+        # LDSM latency hides behind the tensor-core math. Double-buffered at
+        # the register level. The outer loop's iteration variable is unused —
+        # gmem progress is tracked by ``k_tile_index`` (the cp.async read
+        # pointer, NUM_STAGES-1 ahead of the smem read pointer because the
+        # prologue prefetched those stages) and smem ring positions by
+        # ``smem_pipe_{read,write}``. Mirrors ``pipelining.cu``.
+        # =====================================================================
+        # Prefetch first k_block from stage 0 into registers.
         cute.copy(
-            s2r_tiled_copy_c,
-            thr_s2r_c.partition_S(sC),
-            thr_s2r_c.retile(tCrC_pre),
+            s2r_tiled_copy_a,
+            tAsA_s2r[None, None, 0, smem_pipe_read],
+            tArA_s2r[None, None, 0],
         )
-        tCrC.store(tCrC_pre.load().to(tCrC.element_type))
+        cute.copy(
+            s2r_tiled_copy_b,
+            tBsB_s2r[None, None, 0, smem_pipe_read],
+            tBrB_s2r[None, None, 0],
+        )
 
-    # =========================================================================
-    # Mainloop: walk every K-tile, every k_block within a tile. The outer
-    # loop's iteration variable is intentionally unused — gmem progress is
-    # tracked by ``k_tile_index`` (the cp.async read pointer, NUM_STAGES-1
-    # ahead of the smem read pointer because the prologue prefetched those
-    # stages) and smem ring positions by ``smem_pipe_{read,write}``. This
-    # mirrors the C++ ``pipelining.cu`` ``for (int ik = 0; ik < NTilesK; ++ik)``
-    # whose ``ik`` is similarly unused inside the body.
-    # =========================================================================
-    for _ in cutlass.range(k_tile_count, unroll_full=False):
-        for k_block in cutlass.range_constexpr(num_k_block):
-            # When we're on the last k_block of this tile, wait for the
-            # next smem stage to arrive and bump smem_pipe_read.
-            if k_block == num_k_block - 1:
-                cute.arch.cp_async_wait_group(NUM_STAGES - 2)
-                cute.arch.sync_threads()
-                smem_pipe_read = smem_pipe_read + 1
-                if smem_pipe_read == NUM_STAGES:
-                    smem_pipe_read = cutlass.Int32(0)
+        for _ in cutlass.range(k_tile_count, unroll_full=False):
+            for k_block in cutlass.range_constexpr(num_k_block):
+                # When we're on the last k_block of this tile, wait for the
+                # next smem stage to arrive and bump smem_pipe_read.
+                if k_block == num_k_block - 1:
+                    cute.arch.cp_async_wait_group(NUM_STAGES - 2)
+                    cute.arch.sync_threads()
+                    smem_pipe_read = smem_pipe_read + 1
+                    if smem_pipe_read == NUM_STAGES:
+                        smem_pipe_read = cutlass.Int32(0)
 
-            # Prefetch next k_block from smem to rmem. After the bump
-            # above (which only fires on the last k_block of the tile),
-            # smem_pipe_read already points at the freshly-synced stage,
-            # so the wrap to k_block=0 reads from the new stage.
-            k_block_next = (k_block + 1) % num_k_block
+                # Prefetch next k_block from smem to rmem. After the bump
+                # above (which only fires on the last k_block of the tile),
+                # smem_pipe_read already points at the freshly-synced stage,
+                # so the wrap to k_block=0 reads from the new stage.
+                k_block_next = (k_block + 1) % num_k_block
+                cute.copy(
+                    s2r_tiled_copy_a,
+                    tAsA_s2r[None, None, k_block_next, smem_pipe_read],
+                    tArA_s2r[None, None, k_block_next],
+                )
+                cute.copy(
+                    s2r_tiled_copy_b,
+                    tBsB_s2r[None, None, k_block_next, smem_pipe_read],
+                    tBrB_s2r[None, None, k_block_next],
+                )
+
+                # On the first k_block of the tile, fire cp.async for the
+                # next smem stage (writes ahead of the current read pointer).
+                if k_block == 0:
+                    # Overshoot guard: when k_tile_index has stepped past
+                    # the end of K, mask everything off so we don't issue
+                    # OOB cp.async.
+                    if k_tile_index >= k_tile_count:
+                        tApA.fill(False)
+                        tBpB.fill(False)
+                    cute.copy(
+                        g2s_tiled_copy_a,
+                        tAgA[None, None, None, k_tile_index],
+                        tAsA[None, None, None, smem_pipe_write],
+                        pred=tApA,
+                    )
+                    cute.copy(
+                        g2s_tiled_copy_b,
+                        tBgB[None, None, None, k_tile_index],
+                        tBsB[None, None, None, smem_pipe_write],
+                        pred=tBpB,
+                    )
+                    cute.arch.cp_async_commit_group()
+                    k_tile_index = k_tile_index + 1
+                    smem_pipe_write = smem_pipe_write + 1
+                    if smem_pipe_write == NUM_STAGES:
+                        smem_pipe_write = cutlass.Int32(0)
+
+                # Tensor-core gemm for this k_block.
+                cute.gemm(
+                    tiled_mma,
+                    tCrC,
+                    tCrA[None, None, k_block],
+                    tCrB[None, None, k_block],
+                    tCrC,
+                )
+    else:
+        # =====================================================================
+        # No register prefetch: only the GMEM -> SMEM -> RF copy pipeline
+        # overlaps work. Each k-tile loads its whole A/B fragment from smem in
+        # one copy, fires the next smem stage's cp.async, then runs the MMA
+        # over every k_block. Because all S2R loads finish before the first
+        # MMA, the smem -> rmem latency is *not* hidden behind the math — this
+        # is the baseline the register pipeline above improves on. Mirrors
+        # ``pipelining_no_reg_prefetch.cu``'s mainloop.
+        # =====================================================================
+        for _ in cutlass.range(k_tile_count, unroll_full=False):
+            # Whole-tile smem -> rmem load (every k_block at once).
             cute.copy(
                 s2r_tiled_copy_a,
-                tAsA_s2r[None, None, k_block_next, smem_pipe_read],
-                tArA_s2r[None, None, k_block_next],
+                tAsA_s2r[None, None, None, smem_pipe_read],
+                tArA_s2r,
             )
             cute.copy(
                 s2r_tiled_copy_b,
-                tBsB_s2r[None, None, k_block_next, smem_pipe_read],
-                tBrB_s2r[None, None, k_block_next],
+                tBsB_s2r[None, None, None, smem_pipe_read],
+                tBrB_s2r,
             )
 
-            # On the first k_block of the tile, fire cp.async for the
-            # next smem stage (writes ahead of the current read pointer).
-            if k_block == 0:
-                # Overshoot guard: when k_tile_index has stepped past
-                # the end of K, mask everything off so we don't issue
-                # OOB cp.async.
-                if k_tile_index >= k_tile_count:
-                    tApA.fill(False)
-                    tBpB.fill(False)
-                cute.copy(
-                    g2s_tiled_copy_a,
-                    tAgA[None, None, None, k_tile_index],
-                    tAsA[None, None, None, smem_pipe_write],
-                    pred=tApA,
-                )
-                cute.copy(
-                    g2s_tiled_copy_b,
-                    tBgB[None, None, None, k_tile_index],
-                    tBsB[None, None, None, smem_pipe_write],
-                    pred=tBpB,
-                )
-                cute.arch.cp_async_commit_group()
-                k_tile_index = k_tile_index + 1
-                smem_pipe_write = smem_pipe_write + 1
-                if smem_pipe_write == NUM_STAGES:
-                    smem_pipe_write = cutlass.Int32(0)
-
-            # Tensor-core gemm for this k_block.
-            cute.gemm(
-                tiled_mma,
-                tCrC,
-                tCrA[None, None, k_block],
-                tCrB[None, None, k_block],
-                tCrC,
+            # Fire cp.async for the next smem stage (writes ahead of read ptr).
+            if k_tile_index >= k_tile_count:
+                tApA.fill(False)
+                tBpB.fill(False)
+            cute.copy(
+                g2s_tiled_copy_a,
+                tAgA[None, None, None, k_tile_index],
+                tAsA[None, None, None, smem_pipe_write],
+                pred=tApA,
             )
+            cute.copy(
+                g2s_tiled_copy_b,
+                tBgB[None, None, None, k_tile_index],
+                tBsB[None, None, None, smem_pipe_write],
+                pred=tBpB,
+            )
+            cute.arch.cp_async_commit_group()
+            k_tile_index = k_tile_index + 1
+            smem_pipe_write = smem_pipe_write + 1
+            if smem_pipe_write == NUM_STAGES:
+                smem_pipe_write = cutlass.Int32(0)
+
+            # MMA over every k_block of the freshly-loaded tile.
+            for k_block in cutlass.range_constexpr(num_k_block):
+                cute.gemm(
+                    tiled_mma,
+                    tCrC,
+                    tCrA[None, None, k_block],
+                    tCrB[None, None, k_block],
+                    tCrC,
+                )
+
+            # Wait for the next stage to land, advance the smem read pointer.
+            cute.arch.cp_async_wait_group(NUM_STAGES - 2)
+            cute.arch.sync_threads()
+            smem_pipe_read = smem_pipe_read + 1
+            if smem_pipe_read == NUM_STAGES:
+                smem_pipe_read = cutlass.Int32(0)
 
     cute.arch.cp_async_wait_group(0)
     cute.arch.sync_threads()
 
     # =========================================================================
-    # Epilogue: R2S -> S2G via smem-staged write, mirroring the
-    # ``IsCvtPrecision`` branch of pipelining.cu (and dynamic_mma.cu
-    # lines 254-294). The accumulator fragment is narrowed to out_dtype
-    # in registers, copied to a swizzled smem buffer sO via an MMA-
-    # derived R2S TiledCopy, then drained to gmem via a contiguous-N TV
-    # layout. The 2-D (CCPY_M, CCPY_N) predicate on the S2G phase
-    # collapses the per-element pred (used in the prologue) because the
-    # S2G TV layout packs each thread's elements along contiguous N
-    # positions.
+    # Epilogue. C and O reuse the now-drained A/B smem: the mainloop's final
+    # cp_async_wait_group(0) + sync above guarantees every thread is done
+    # reading sA / sB, so the region is free to overwrite.
     # =========================================================================
+
+    # ----- Fold the C addend into the accumulator (accumulate path only) -----
+    if cutlass.const_expr(not is_gemm):
+        # sC (compute-C dtype) aliases sA's storage. An fp32 BLK_M x BLK_N
+        # tile spans sA plus part of the contiguous sB, both dead here. The
+        # swizzle must stay in the make_tensor layout (where partition_D
+        # composes it correctly); recast_ptr only adjusts the element dtype
+        # (and strips to a bare pointer). Splitting the swizzle into
+        # recast_ptr instead mis-maps partition_D under Swizzle<3,3,3> on
+        # SM80-class ldmatrix/cp.async copies — that form is for SM90 TMA.
+        sC = cute.make_tensor(
+            cute.recast_ptr(sA.iterator, dtype=mC.element_type),
+            sC_layout,
+        )
+        tCsC = thr_g2s_c.partition_D(sC)
+
+        # Coalesced gmem -> smem load of C with the M / N residue predicate
+        # (C has no K mode, so no K bound). Predicate-off slots stay zero and
+        # add nothing.
+        tCsC.fill(0)
+        for m in cutlass.range_constexpr(cute.size(tCgC, mode=[1])):
+            for n in cutlass.range_constexpr(cute.size(tCgC, mode=[2])):
+                if cute.elem_less(tCcC[0, m, n][0], m_max) and cute.elem_less(
+                    tCcC[0, m, n][1],
+                    n_max,
+                ):
+                    cute.copy(
+                        g2s_tiled_copy_c,
+                        tCgC[None, m, n],
+                        tCsC[None, m, n],
+                    )
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+        # smem -> rmem into a C-shaped fragment, then acc += C (in acc dtype).
+        tCrC_add = cute.make_fragment_like(tCrC, mC.element_type)
+        cute.copy(
+            s2r_tiled_copy_c,
+            thr_s2r_c.partition_S(sC),
+            thr_s2r_c.retile(tCrC_add),
+        )
+        tCrC.store(tCrC.load() + tCrC_add.load().to(tCrC.element_type))
+
+        # All threads must finish reading sC before sO overwrites the region.
+        cute.arch.sync_threads()
+
+    # ----- Narrow to out_dtype, R2S -> S2G via a swizzled smem buffer -----
+    # sO (out dtype, which equals A's dtype for every spec) aliases sA's
+    # storage via a plain full-ComposedLayout make_tensor. The split
+    # .outer / .inner form mis-maps swizzled upper-half columns in the r2s
+    # partition_D store, so the plain form is mandatory here.
+    sO = cute.make_tensor(sA.iterator, sO_layout)
+
     tCrO = cute.make_fragment_like(tCrC, out_dtype)
     tCrO.store(tCrC.load().to(out_dtype))
 
@@ -649,6 +766,13 @@ def pipelining_gemm(
         grid=(grid_n, grid_m, 1),
         block=(NUM_THREADS, 1, 1),
         stream=stream,
+        # Require >= 2 resident blocks per SM (nvvm.minctasm). Unconstrained,
+        # CuTeDSL's register allocator runs ILP-greedy to ~160 reg/thread (not
+        # a spill, just loose) and caps occupancy at one block/SM on H100/H200.
+        # The hint tightens the budget to <=128 reg/thread so two blocks share
+        # an SM; combined with the sC/sO smem aliasing the footprint (96KB for
+        # the default tile) leaves room for that second block.
+        min_blocks_per_mp=2,
     )
 
 

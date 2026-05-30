@@ -181,7 +181,7 @@ def dynamic_mma_kernel(
     # No dynamic loop here so we can inline a per-(m, n) bound check.
     # Out-of-bounds slots are left at zero from the smem fill.
     if cutlass.const_expr(not is_gemm):
-        thr_g2s_c.partition_D(sC).fill(0)
+        tCsC.fill(0)
         for m in cutlass.range_constexpr(cute.size(tCgC, mode=[1])):
             for n in cutlass.range_constexpr(cute.size(tCgC, mode=[2])):
                 if cute.elem_less(tCcC[0, m, n][0], m_max) and cute.elem_less(
