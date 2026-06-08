@@ -198,7 +198,7 @@ def main() -> None:
         make_cute_tensor(c),
         make_fake_stream(use_tvm_ffi_env_stream=True),
         True,
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --generate-line-info",
     )
     gemm_accum = cute.compile(
         minimal_gemm,
@@ -207,7 +207,7 @@ def main() -> None:
         make_cute_tensor(c),
         make_fake_stream(use_tvm_ffi_env_stream=True),
         False,
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --generate-line-info",
     )
 
     for exp in exps:

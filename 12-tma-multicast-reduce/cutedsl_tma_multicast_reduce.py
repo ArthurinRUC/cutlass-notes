@@ -746,7 +746,7 @@ def _compile_variants(a_template, b_template, c_template, d_template, acc_dtype,
         out_dtype,
         True,
         use_reduce_add,
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --generate-line-info",
     )
     g_accum = cute.compile(
         tma_multicast_reduce,
@@ -759,7 +759,7 @@ def _compile_variants(a_template, b_template, c_template, d_template, acc_dtype,
         out_dtype,
         False,
         use_reduce_add,
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --generate-line-info",
     )
     return g_clear, g_accum
 
