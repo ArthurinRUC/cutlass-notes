@@ -569,7 +569,7 @@ def _compile_pair(a_template, b_template, c_template, d_template, acc_dtype, out
         acc_dtype,
         out_dtype,
         True,
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --generate-line-info",
     )
     g_accum = cute.compile(
         tma_load_store,
@@ -581,7 +581,7 @@ def _compile_pair(a_template, b_template, c_template, d_template, acc_dtype, out
         acc_dtype,
         out_dtype,
         False,
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --generate-line-info",
     )
     return g_clear, g_accum
 

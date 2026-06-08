@@ -232,7 +232,7 @@ def main() -> None:
         make_fake_stream(use_tvm_ffi_env_stream=True),
         cutlass.BFloat16,
         True,
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --generate-line-info",
     )
     gemm_accum = cute.compile(
         block_mma_gemm,
@@ -243,7 +243,7 @@ def main() -> None:
         make_fake_stream(use_tvm_ffi_env_stream=True),
         cutlass.BFloat16,
         False,
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --generate-line-info",
     )
 
     print(f" M={M}, N={N}, K={K} ".center(PRINT_LENGTH, "-"))

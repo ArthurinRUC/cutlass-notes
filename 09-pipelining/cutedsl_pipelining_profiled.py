@@ -1,5 +1,10 @@
 """Multi-stage cp.async pipelined GEMM in CuTe DSL.
 
+A near-verbatim copy of ``cutedsl_pipelining.py`` plus an in-kernel timeline
+profiler (see ``cutedsl_sm_profiler.py``): the only kernel changes are
+``%globaltimer`` stamps at the phase boundaries, gated by a ``profile_enabled``
+constexpr so the kernel is unchanged when profiling is off.
+
 CuTe DSL counterpart of ``pipelining.cu`` / ``pipelining.py``. Extends
 ``08-dynamic-mma`` with two pipelines stacked on top:
 
@@ -60,6 +65,9 @@ Smem footprint / occupancy:
     with a 2-D (CCPY_M, CCPY_N) S2G predicate for M/N residue handling.
 """
 
+from pathlib import Path
+
+import cutedsl_sm_profiler as smprof
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -94,6 +102,25 @@ NUM_THREADS = (
     ATOM_LAYOUT_MNK[0] * ATOM_LAYOUT_MNK[1] * ATOM_LAYOUT_MNK[2] * 32  # 256
 )
 
+# Profiler event types for THIS kernel (the profiler itself is generic and knows
+# nothing about these -- they are registered with names on the host side). The
+# four phases are recorded once each; compute/wait are recorded once per
+# mainloop k-tile, so a warp emits 4 + 2*k_tile_count events.
+PROF_TOTAL = 0
+PROF_PROLOGUE = 1
+PROF_MAINLOOP = 2
+PROF_EPILOGUE = 3
+PROF_COMPUTE = 4
+PROF_WAIT = 5
+PROF_EVENT_NAMES = {
+    PROF_TOTAL: "total",
+    PROF_PROLOGUE: "prologue",
+    PROF_MAINLOOP: "mainloop",
+    PROF_EPILOGUE: "epilogue",
+    PROF_COMPUTE: "compute",
+    PROF_WAIT: "wait",
+}
+
 
 # -----------------------------------------------------------------------------
 # Device kernel
@@ -121,12 +148,24 @@ def pipelining_kernel(
     sO_layout: cute.ComposedLayout,
     out_dtype: cutlass.Constexpr,
     is_gemm: cutlass.Constexpr[bool],
+    # Profiling is opt-in via this single bundled handle. A disabled ``prof``
+    # (its buffer is None) lowers to no device argument and folds every
+    # profiler call to nothing, so the kernel is then identical to
+    # ``cutedsl_pipelining.py``.
+    prof: smprof.ProfilerArgs = smprof.ProfilerArgs(None, False),
 ):
     tid, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
 
     M, K = mA.shape
     N, _ = mB.shape
+
+    # Open a profiling session once (resolves this warp's ids + buffer sizes a
+    # single time, from the grid dims and the buffer header); call sites then
+    # just name an event type.
+    prof_ctx = prof.begin()
+    prof_ctx.event_start(PROF_TOTAL)
+    prof_ctx.event_start(PROF_PROLOGUE)
 
     # 3-D block tiler — gA / gB carry a K-tile iteration mode.
     tiler = (BLK_M, BLK_N, BLK_K)
@@ -341,6 +380,9 @@ def pipelining_kernel(
     # =========================================================================
     cute.arch.cp_async_wait_group(NUM_STAGES - 2)
     cute.arch.sync_threads()
+    # Prologue prefetch done; close the prologue range and open the mainloop in
+    # one stamp (the two slices abut).
+    prof_ctx.event_switch(PROF_PROLOGUE, PROF_MAINLOOP)
 
     num_k_block = cute.size(tCrA, mode=[2])
     smem_pipe_read = cutlass.Int32(0)
@@ -448,6 +490,11 @@ def pipelining_kernel(
         # ``pipelining_no_reg_prefetch.cu``'s mainloop.
         # =====================================================================
         for _ in cutlass.range(k_tile_count, unroll_full=False):
+            # Per-tile "compute" event opens here (S2R load + MMAs). The append
+            # counter gives it the next event_id, so compute events land in
+            # k-tile order; folds to nothing when profiling is off.
+            prof_ctx.event_start(PROF_COMPUTE)
+
             # Whole-tile smem -> rmem load (every k_block at once).
             cute.copy(
                 s2r_tiled_copy_a,
@@ -492,15 +539,26 @@ def pipelining_kernel(
                     tCrC,
                 )
 
+            # Close "compute" and open "wait" with a single stamp (after this
+            # tile's MMAs, before the cp.async wait). This boundary is the one
+            # mark not anchored by a __syncthreads; the compiler barrier inside
+            # the timestamp read keeps it from drifting. Fusing the two halves the
+            # boundary's timer reads and makes the slices abut exactly.
+            prof_ctx.event_switch(PROF_COMPUTE, PROF_WAIT)
+
             # Wait for the next stage to land, advance the smem read pointer.
             cute.arch.cp_async_wait_group(NUM_STAGES - 2)
             cute.arch.sync_threads()
+            # Close "wait" (barrier-anchored by the sync above).
+            prof_ctx.event_end(PROF_WAIT)
             smem_pipe_read = smem_pipe_read + 1
             if smem_pipe_read == NUM_STAGES:
                 smem_pipe_read = cutlass.Int32(0)
 
     cute.arch.cp_async_wait_group(0)
     cute.arch.sync_threads()
+    # Mainloop drained; close the mainloop range and open the epilogue (one stamp).
+    prof_ctx.event_switch(PROF_MAINLOOP, PROF_EPILOGUE)
 
     # =========================================================================
     # Epilogue. C and O reuse the now-drained A/B smem: the mainloop's final
@@ -603,6 +661,11 @@ def pipelining_kernel(
             )
     cute.copy(s2g_tiled_copy_o, tOsO_s2g, tOgO_s2g, pred=tOpO_s2g)
 
+    # Close the epilogue and total ranges. The compiler barrier inside event_end
+    # already keeps the final clock read from being hoisted above the S2G store.
+    prof_ctx.event_end(PROF_EPILOGUE)
+    prof_ctx.event_end(PROF_TOTAL)
+
 
 @cute.jit
 def pipelining_gemm(
@@ -614,6 +677,9 @@ def pipelining_gemm(
     acc_dtype: cutlass.Constexpr,
     out_dtype: cutlass.Constexpr,
     is_gemm: cutlass.Constexpr[bool],
+    prof_buffer=None,
+    profile_enabled: cutlass.Constexpr[bool] = False,
+    profile_show_overhead: cutlass.Constexpr[bool] = False,
 ):
     # ----- Tiled MMA -----
     op = cute.nvgpu.warp.MmaF16BF16Op(
@@ -742,6 +808,10 @@ def pipelining_gemm(
     grid_n = (N + BLK_N - 1) // BLK_N
     grid_m = (M + BLK_M - 1) // BLK_M
 
+    # Bundle into the single handle the kernel takes. With profiling off the
+    # default args make this ProfilerArgs(None, False) -> no buffer arg.
+    prof = smprof.ProfilerArgs(prof_buffer, profile_enabled, profile_show_overhead)
+
     pipelining_kernel(
         mA,
         mB,
@@ -762,6 +832,7 @@ def pipelining_gemm(
         sO_layout,
         out_dtype,
         is_gemm,
+        prof,
     ).launch(
         grid=(grid_n, grid_m, 1),
         block=(NUM_THREADS, 1, 1),
@@ -854,6 +925,197 @@ def _compile_pair(a_template, b_template, c_template, o_template, acc_dtype, out
         options="--enable-tvm-ffi --generate-line-info",
     )
     return g_clear, g_accum
+
+
+def _events_per_warp(K: int) -> int:
+    """How many range events one warp emits for a given K.
+
+    4 phase ranges (total / prologue / mainloop / epilogue) plus, when the
+    register pipeline is disabled (``REG_STAGES == 1``), 2 ranges (compute, wait)
+    per k-tile. Each ``event_start`` bumps the per-warp append counter once, so
+    this is exactly the largest ``event_id`` the warp reaches; the profiler's
+    ``max_events_per_warp`` must be at least this or trailing events are dropped.
+    """
+    k_tiles = (K + BLK_K - 1) // BLK_K
+    return 4 + (2 * k_tiles if REG_STAGES < 2 else 0)
+
+
+def _profile_once(M: int, N: int, K: int, out_dir: Path, show_overhead: bool) -> None:
+    """Compile + run ONE profiled bf16 GEMM and dump its summary + Perfetto trace.
+
+    ``show_overhead`` is a compile-time constant: with it on, the kernel records
+    the extra start/end stamps and the export draws the two overhead bands; with
+    it off, neither the device nor the trace carries any overhead data (the
+    minimal-overhead reference). The two settings write to distinct files.
+    """
+    num_warps = NUM_THREADS // 32
+    num_blocks = ((M + BLK_M - 1) // BLK_M) * ((N + BLK_N - 1) // BLK_N)
+
+    torch.cuda.manual_seed_all(9527)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    c = torch.randn(M, N, device="cuda", dtype=torch.float32)
+
+    # Per-warp event capacity, sized from K with a small margin so nothing is
+    # dropped (events beyond it are silently dropped — the counter keeps
+    # advancing but no record is written).
+    max_events = _events_per_warp(K) + 8
+    profiler = smprof.SmProfiler(num_blocks, num_warps, max_events)
+    for event_no, name in PROF_EVENT_NAMES.items():
+        profiler.register_event(event_no, name)
+    g = cute.compile(
+        pipelining_gemm,
+        make_cute_tensor(a),
+        make_cute_tensor(b),
+        make_cute_tensor(c),
+        make_cute_tensor(torch.empty(M, N, device="cuda", dtype=torch.bfloat16)),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        cutlass.Float32,
+        cutlass.BFloat16,
+        False,
+        profiler.cute_buffer(),
+        True,
+        show_overhead,
+        options="--enable-tvm-ffi --generate-line-info",
+    )
+    out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    profiler.reset()
+    g(a, b, c.clone(), out, profiler.buffer)
+    torch.cuda.synchronize()
+
+    ref = torch.addmm(c, a.float(), b.T.float()).bfloat16()
+    tag = "overhead-on" if show_overhead else "overhead-off"
+    print(
+        f" profiled bf16 {M}x{N}x{K} [{tag}]: RE = {relative_error(out.float(), ref.float()) * 100:.2f}% ".center(
+            PRINT_LENGTH, "="
+        )
+    )
+    profiler.summarize(f"bf16 {M}x{N}x{K} [{tag}]")
+
+    # Discriminating dump: with the bands recorded, show the raw start/end
+    # overhead widths for a handful of events so a zero band (CSE'd reads /
+    # sub-resolution timer) is distinguishable from a real one. Also persist the
+    # raw buffer for offline re-analysis.
+    if show_overhead:
+        print(" raw overhead widths (ns) for first events ".center(PRINT_LENGTH, "-"))
+        print(f"{'event':<12}{'start_ovh':>12}{'end_ovh':>12}{'interval':>12}")
+        for _ in range(8):
+            for record in profiler._records():
+                name = PROF_EVENT_NAMES.get(record.event_no, f"event_{record.event_no}")
+                # A band is only defined when its inner stamp was recorded (> 0). An
+                # event closed by event_switch shares the boundary stamp and has no
+                # end band, so en_early stays 0 -> report 0 rather than en - 0.
+                start_ovh = record.st_late - record.st if record.st_late > 0 else 0
+                end_ovh = record.en - record.en_early if record.en_early > 0 else 0
+                print(f"{name:<12}{start_ovh:>12d}{end_ovh:>12d}{record.en - record.st:>12d}")
+        buf_path = out_dir / f"pipelining_bf16_M{M}_N{N}_K{K}_buffer.pt"
+        torch.save(profiler.buffer.cpu(), str(buf_path))
+        print(f" raw buffer -> {buf_path} ".center(PRINT_LENGTH, "-"))
+
+    suffix = "_overhead" if show_overhead else ""
+    json_path = out_dir / f"pipelining_bf16_M{M}_N{N}_K{K}{suffix}.json"
+    n_events = profiler.export_perfetto(str(json_path), show_overhead=show_overhead)
+    print(f" Perfetto: {n_events} slices -> {json_path} ".center(PRINT_LENGTH, "-"))
+
+
+def profile_demo() -> None:
+    """Dump a profiled 4096x4096x4096 bf16 GEMM trace (overhead bands OFF).
+
+    This is the only path that passes a profiler buffer (profiling on); the
+    sweep in ``main`` compiles with profiling off, so no buffer is threaded
+    through and the kernel matches ``cutedsl_pipelining.py``.
+
+    Exports the full all-block trace without overhead bands (the overhead-on
+    variant at this size would be a ~3x larger JSON; use a smaller M/N if you
+    want to inspect the per-event overhead bands). ``max_events`` is derived from
+    K so the per-warp capacity always covers the kernel's event count.
+    """
+    out_dir = Path(__file__).resolve().parent.parent / ".claude" / "perf" / "inkernel_profile"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    M, N, K = 4096, 4096, 4096
+    _profile_once(M, N, K, out_dir, show_overhead=False)
+
+
+def bench_overhead(M: int = 512, N: int = 512, K: int = 4096, iters: int = 100, repeats: int = 10) -> None:
+    """Profiling-off vs profiling-on wall-clock comparison + overhead breakdown.
+
+    Compiles three variants of the SAME bf16 GEMM and times each over
+    ``repeats`` batches of ``iters`` launches (CUDA events, warmup discarded):
+
+      * off          -- profiling disabled (the production kernel)
+      * on (phases)  -- only the 4 coarse phase events (outside the hot loop)
+      * on (full)    -- phases + the 2 per-k-tile events inside the mainloop
+
+    ``on(phases) - off`` is the profiler's FIXED cost; ``on(full) - on(phases)``
+    is the per-tile (hot-loop) cost -- i.e. where the overhead lives.
+    """
+    num_warps = NUM_THREADS // 32
+    num_blocks = ((M + BLK_M - 1) // BLK_M) * ((N + BLK_N - 1) // BLK_N)
+    k_tiles = (K + BLK_K - 1) // BLK_K
+
+    torch.cuda.manual_seed_all(9527)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    c = torch.randn(M, N, device="cuda", dtype=torch.float32).clone()
+    out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+    o_tmpl = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+
+    def _compile(profile_enabled, prof_buffer):
+        return cute.compile(
+            pipelining_gemm,
+            make_cute_tensor(a),
+            make_cute_tensor(b),
+            make_cute_tensor(c),
+            make_cute_tensor(o_tmpl),
+            make_fake_stream(use_tvm_ffi_env_stream=True),
+            cutlass.Float32,
+            cutlass.BFloat16,
+            False,
+            prof_buffer,
+            profile_enabled,
+            options="--enable-tvm-ffi --generate-line-info",
+        )
+
+    g_off = _compile(False, None)
+    profiler = smprof.SmProfiler(num_blocks, num_warps, _events_per_warp(K) + 8)
+    g_on = _compile(True, profiler.cute_buffer())
+
+    def _time(run):
+        for _ in range(10):  # warmup
+            run()
+        torch.cuda.synchronize()
+        per_iter = []
+        for _ in range(repeats):
+            start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iters):
+                run()
+            stop.record()
+            torch.cuda.synchronize()
+            per_iter.append(start.elapsed_time(stop) / iters * 1000.0)  # us
+        t = torch.tensor(per_iter)
+        return t.mean().item(), t.std().item()
+
+    off = _time(lambda: g_off(a, b, c, out))
+    profiler.reset()
+    on = _time(lambda: g_on(a, b, c, out, profiler.buffer))
+
+    events_per_warp = 4 + 2 * k_tiles  # 4 phases + 2 (compute, wait) per k-tile
+    overhead = on[0] - off[0]
+    print(
+        f" Profiler overhead: bf16 {M}x{N}x{K}, {num_blocks} blocks x {num_warps} warps, "
+        f"{k_tiles} k-tiles, {iters}x{repeats} ".center(PRINT_LENGTH, "=")
+    )
+    print(f"{'variant':<18}{'us/iter':>12}{'std':>10}{'vs off':>12}")
+    print(f"{'off (no profile)':<18}{off[0]:>12.2f}{off[1]:>10.2f}{'--':>12}")
+    print(f"{'on (profiled)':<18}{on[0]:>12.2f}{on[1]:>10.2f}{overhead:>+12.2f}")
+    print("-" * PRINT_LENGTH)
+    print(
+        f"total overhead: {overhead:+.2f} us ({overhead / off[0] * 100:+.1f}% of off), "
+        f"{events_per_warp} events/warp -> ~{overhead / events_per_warp * 1000:.0f} ns/event, "
+        f"{overhead / k_tiles * 1000:.0f} ns/k-tile"
+    )
 
 
 def main() -> None:
@@ -977,4 +1239,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    profile_demo()
     main()

@@ -242,7 +242,7 @@ def compile_for(out_torch_dtype: torch.dtype, out_cutlass_dtype):
         out_cutlass_dtype,
         True,
         is_cvt,
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --generate-line-info",
     )
     gemm_accum = cute.compile(
         mixed_precision_gemm,
@@ -254,7 +254,7 @@ def compile_for(out_torch_dtype: torch.dtype, out_cutlass_dtype):
         out_cutlass_dtype,
         False,
         is_cvt,
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --generate-line-info",
     )
     return gemm_clear, gemm_accum
 
