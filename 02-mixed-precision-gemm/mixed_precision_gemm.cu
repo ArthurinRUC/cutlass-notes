@@ -4,7 +4,7 @@
 #include <torch/extension.h>
 #include <torch/types.h>
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && ((__CUDACC_VER_MAJOR__ >= 12) && (__CUDACC_VER_MINOR__ >= 4)))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && (__CUDACC_VER_MAJOR__ * 100 + __CUDACC_VER_MINOR__ >= 1204))
 #define CUTE_ARCH_MMA_SM89_ENABLED
 #endif
 
@@ -126,7 +126,7 @@ struct SM90_16x8x32_F32E4M3E5M2F32_TN {
                  : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 #else
-    CUTE_INVALID_CONTROL_PATH("Attempting to use SM90_16x8x32_F32E4M3E5M2F32_TN without CUTE_ARCH_MMA_SM89_ENABLED");
+    CUTE_INVALID_CONTROL_PATH("Attempting to use SM90_16x8x32_F32E4M3E5M2F32_TN without CUTE_ARCH_MMA_SM89_ENABLED\n");
 #endif
   }
 };
